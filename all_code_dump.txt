@@ -1,0 +1,960 @@
+==================================================
+FILE: D:\Learn\rust\balance-service\src\config.rs
+==================================================
+
+use thiserror::Error;
+
+#[derive(Debug, Clone)]
+pub struct AppConfig {
+    pub bind_addr: String,
+    pub mongodb_uri: String,
+    pub mongodb_db_main: String,
+
+    // NEW (Phase 4)
+    pub worker_enabled: bool,
+    pub worker_poll_ms: u64,
+}
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("missing env var: {0}")]
+    MissingEnv(&'static str),
+}
+
+impl AppConfig {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+
+        let mongodb_uri =
+            std::env::var("MONGODB_URI").map_err(|_| ConfigError::MissingEnv("MONGODB_URI"))?;
+
+        let mongodb_db_main = std::env::var("MONGODB_DB_MAIN")
+            .map_err(|_| ConfigError::MissingEnv("MONGODB_DB_MAIN"))?;
+
+        // NEW (Phase 4) – optional env vars
+        let worker_enabled = std::env::var("WORKER_ENABLED")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true);
+
+        let worker_poll_ms = std::env::var("WORKER_POLL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(500);
+
+        Ok(Self {
+            bind_addr,
+            mongodb_uri,
+            mongodb_db_main,
+            worker_enabled,
+            worker_poll_ms,
+        })
+    }
+}
+
+
+
+==================================================
+FILE: D:\Learn\rust\balance-service\src\core\key.rs
+==================================================
+
+use sha2::{Digest, Sha256};
+
+pub fn request_key_from_canonical_json(canonical_json: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(canonical_json.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+
+
+==================================================
+FILE: D:\Learn\rust\balance-service\src\core\mod.rs
+==================================================
+
+pub mod key;
+pub mod normalize;
+
+
+
+==================================================
+FILE: D:\Learn\rust\balance-service\src\core\normalize.rs
+==================================================
+
+use crate::http::dto::{BalanceRequest, ContractGroup};
+
+fn lc(s: &str) -> String {
+    s.trim().to_lowercase()
+}
+
+pub fn normalize_request(req: &BalanceRequest) -> BalanceRequest {
+    // Normalize wallets
+    let mut wallets: Vec<String> = req.walletAddresses.iter().map(|w| lc(w)).collect();
+    wallets.sort();
+    wallets.dedup();
+
+    // Normalize contracts per network
+    let mut contracts: Vec<ContractGroup> = req
+        .contracts
+        .iter()
+        .map(|c| {
+            let mut addrs: Vec<String> = c.contractAddresses.iter().map(|a| lc(a)).collect();
+            addrs.sort();
+            addrs.dedup();
+
+            ContractGroup {
+                networkName: lc(&c.networkName),
+                contractAddresses: addrs,
+            }
+        })
+        .collect();
+
+    // sort by networkName
+    contracts.sort_by(|a, b| a.networkName.cmp(&b.networkName));
+
+    BalanceRequest {
+        contracts,
+        walletAddresses: wallets,
+    }
+}
+
+
+
+==================================================
+FILE: D:\Learn\rust\balance-service\src\db\mod.rs
+==================================================
+
+pub mod models;
+pub mod mongo;
+pub mod refresh_jobs;
+pub mod snapshots;
+
+
+
+==================================================
+FILE: D:\Learn\rust\balance-service\src\db\models.rs
+==================================================
+
+use bson::DateTime;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceSnapshotDoc {
+    pub request_key: String,
+    pub normalized_request: serde_json::Value,
+    pub result: serde_json::Value,
+    pub last_updated_at: DateTime,
+    pub refresh_state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceRefreshJobDoc {
+    pub request_key: String,
+    pub status: String, // queued | running | done | failed
+    pub attempts: i32,
+    pub next_retry_at: Option<DateTime>,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
+
+
+==================================================
+FILE: D:\Learn\rust\balance-service\src\db\mongo.rs
+==================================================
+
+use crate::config::AppConfig;
+use mongodb::{Client, Database};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum MongoError {
+    #[error("mongodb error: {0}")]
+    Mongo(#[from] mongodb::error::Error),
+}
+
+#[derive(Clone)]
+pub struct Mongo {
+    pub db: Database,
+}
+
+impl Mongo {
+    pub async fn connect(cfg: &AppConfig) -> Result<Self, MongoError> {
+        let client = Client::with_uri_str(&cfg.mongodb_uri).await?;
+        let db = client.database(&cfg.mongodb_db_main);
+        Ok(Self { db })
+    }
+}
+
+
+
+==================================================
+FILE: D:\Learn\rust\balance-service\src\db\refresh_jobs.rs
+==================================================
+
+// use crate::db::models::BalanceRefreshJobDoc;
+// use bson::{doc, DateTime};
+// use mongodb::Collection;
+
+// pub fn refresh_jobs_collection(db: &mongodb::Database) -> Collection<BalanceRefreshJobDoc> {
+//     db.collection::<BalanceRefreshJobDoc>("balance_refresh_jobs")
+// }
+
+// pub async fn ensure_indexes(db: &mongodb::Database) -> Result<(), mongodb::error::Error> {
+//     use mongodb::{options::IndexOptions, IndexModel};
+
+//     let coll = refresh_jobs_collection(db);
+
+//     let model = IndexModel::builder()
+//         .keys(doc! { "requestKey": 1 })
+//         .options(IndexOptions::builder().unique(true).build())
+//         .build();
+
+//     coll.create_index(model).await?;
+//     Ok(())
+// }
+
+// /// Try to enqueue a refresh job (deduped by requestKey)
+// pub async fn enqueue_if_not_exists(
+//     db: &mongodb::Database,
+//     request_key: &str,
+// ) -> Result<bool, mongodb::error::Error> {
+//     let coll = refresh_jobs_collection(db);
+//     let now = DateTime::now();
+
+//     let filter = doc! { "requestKey": request_key };
+//     let update = doc! {
+//         "$setOnInsert": {
+//             "requestKey": request_key,
+//             "status": "queued",
+//             "attempts": 0,
+//             "nextRetryAt": null,
+//             "createdAt": now,
+//             "updatedAt": now
+//         }
+//     };
+
+//     let result = coll.update_one(filter, update).upsert(true).await?;
+
+//     // If upserted_id is Some → job was created
+//     Ok(result.upserted_id.is_some())
+// }
+
+use crate::db::models::BalanceRefreshJobDoc;
+use bson::{ doc, DateTime };
+use mongodb::Collection;
+
+pub fn refresh_jobs_collection(db: &mongodb::Database) -> Collection<BalanceRefreshJobDoc> {
+    db.collection::<BalanceRefreshJobDoc>("balance_refresh_jobs")
+}
+
+pub async fn ensure_indexes(db: &mongodb::Database) -> Result<(), mongodb::error::Error> {
+    use mongodb::{ options::IndexOptions, IndexModel };
+
+    let coll = refresh_jobs_collection(db);
+
+    let model = IndexModel::builder()
+        .keys(doc! { "requestKey": 1 })
+        .options(IndexOptions::builder().unique(true).build())
+        .build();
+
+    coll.create_index(model).await?;
+    Ok(())
+}
+
+/// Enqueue a refresh job if it doesn't exist.
+/// If it exists and is `done` or `failed`, re-queue it.
+/// If it's already `queued` or `running`, do nothing.
+///
+/// Returns:
+/// - Ok(true) if we actually queued/re-queued a job
+/// - Ok(false) if job already queued/running and we did nothing
+pub async fn enqueue_or_requeue(
+    db: &mongodb::Database,
+    request_key: &str
+) -> Result<bool, mongodb::error::Error> {
+    let coll = refresh_jobs_collection(db);
+    let now = DateTime::now();
+
+    // 1) Try to re-queue an existing completed/failed job
+    let requeue_filter =
+        doc! {
+        "requestKey": request_key,
+        "status": { "$in": ["done", "failed"] }
+    };
+
+    let requeue_update =
+        doc! {
+        "$set": {
+        "status": "queued",
+        "updatedAt": now,
+        "nextRetryAt": bson::Bson::Null,
+        "attempts": 0
+    }
+    };
+
+    let requeue_result = coll.update_one(requeue_filter, requeue_update).upsert(false).await?;
+    if requeue_result.modified_count == 1 {
+        return Ok(true);
+    }
+
+    // 2) If no existing job was re-queued, try to create a new one (dedup by unique index)
+    let insert_filter = doc! { "requestKey": request_key };
+    let insert_update =
+        doc! {
+        "$setOnInsert": {
+            "requestKey": request_key,
+            "status": "queued",
+            "attempts": 0,
+            "nextRetryAt": bson::Bson::Null,
+            "createdAt": now,
+            "updatedAt": now
+        }
+    };
+
+    let insert_result = coll.update_one(insert_filter, insert_update).upsert(true).await?;
+
+    // If upserted_id is Some → job was created now
+    // If None → job existed already (likely queued/running/done/failed but not matched above)
+    Ok(insert_result.upserted_id.is_some())
+}
+
+
+
+==================================================
+FILE: D:\Learn\rust\balance-service\src\db\snapshots.rs
+==================================================
+
+use crate::db::models::BalanceSnapshotDoc;
+use bson::doc;
+use mongodb::Collection;
+
+pub fn snapshots_collection(db: &mongodb::Database) -> Collection<BalanceSnapshotDoc> {
+    db.collection::<BalanceSnapshotDoc>("balance_snapshots")
+}
+
+/// Create unique index on requestKey once (call at startup in Phase 2+).
+pub async fn ensure_indexes(db: &mongodb::Database) -> Result<(), mongodb::error::Error> {
+    use mongodb::options::IndexOptions;
+    use mongodb::IndexModel;
+
+    let coll = snapshots_collection(db);
+    let model = IndexModel::builder()
+        .keys(doc! { "requestKey": 1 })
+        .options(IndexOptions::builder().unique(true).build())
+        .build();
+
+    coll.create_index(model).await?;
+    Ok(())
+}
+
+pub async fn get_snapshot(
+    db: &mongodb::Database,
+    request_key: &str,
+) -> Result<Option<BalanceSnapshotDoc>, mongodb::error::Error> {
+    let coll = snapshots_collection(db);
+    let filter = doc! { "requestKey": request_key };
+    coll.find_one(filter).await
+}
+
+pub async fn upsert_empty_snapshot(
+    db: &mongodb::Database,
+    request_key: &str,
+    normalized_request_json: serde_json::Value,
+    empty_result_json: serde_json::Value,
+) -> Result<(), mongodb::error::Error> {
+    let coll = snapshots_collection(db);
+    let filter = doc! { "requestKey": request_key };
+
+    let now = bson::DateTime::now();
+
+    let update = doc! {
+        "$setOnInsert": {
+            "requestKey": request_key,
+            "normalizedRequest": bson::to_bson(&normalized_request_json)
+                .unwrap_or(bson::Bson::Null),
+            "result": bson::to_bson(&empty_result_json)
+                .unwrap_or(bson::Bson::Null),
+            "lastUpdatedAt": now,
+            "refreshState": "idle"
+        }
+    };
+
+    coll.update_one(filter, update).upsert(true).await?;
+
+    Ok(())
+}
+
+/// ===============================
+/// NEW — Phase 4 helper
+/// Keeps snapshot state consistent
+/// ===============================
+pub async fn set_refresh_state(
+    db: &mongodb::Database,
+    request_key: &str,
+    state: &str,
+) -> Result<(), mongodb::error::Error> {
+    let coll = snapshots_collection(db);
+
+    coll.update_one(
+        doc! { "requestKey": request_key },
+        doc! { "$set": { "refreshState": state } },
+    )
+    .await?;
+
+    Ok(())
+}
+
+
+
+==================================================
+FILE: D:\Learn\rust\balance-service\src\http\dto.rs
+==================================================
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractGroup {
+    pub networkName: String,
+    pub contractAddresses: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BalanceRequest {
+    pub contracts: Vec<ContractGroup>,
+    pub walletAddresses: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BalanceResponse {
+    pub status: bool,
+    pub result: serde_json::Value,
+}
+
+pub fn empty_legacy_result() -> serde_json::Value {
+    serde_json::json!({
+        "data": [],
+        "total": { "balance": {} }
+    })
+}
+
+
+
+==================================================
+FILE: D:\Learn\rust\balance-service\src\http\handlers.rs
+==================================================
+
+use crate::core::key::request_key_from_canonical_json;
+use crate::core::normalize::normalize_request;
+use crate::db::{refresh_jobs, snapshots};
+use crate::http::dto::{empty_legacy_result, BalanceRequest, BalanceResponse};
+use crate::AppState;
+
+use axum::{extract::State, Json};
+use bson::DateTime;
+use serde_json::json;
+
+const STALE_AFTER_SECS: i64 = 30;
+
+pub async fn health() -> &'static str {
+    "ok"
+}
+
+pub async fn get_multi_wallet_balances(
+    State(state): State<AppState>,
+    Json(req): Json<BalanceRequest>,
+) -> Json<BalanceResponse> {
+    // 1) Normalize + canonicalize request
+    let normalized = normalize_request(&req);
+    let canonical = serde_json::to_string(&normalized).unwrap_or_else(|_| "{}".to_string());
+    let request_key = request_key_from_canonical_json(&canonical);
+
+    let now = DateTime::now();
+
+    match snapshots::get_snapshot(&state.mongo.db, &request_key).await {
+        // ============================
+        // CASE 1: Snapshot exists
+        // ============================
+        Ok(Some(doc)) => {
+            let age_secs = (now.timestamp_millis() - doc.last_updated_at.timestamp_millis()) / 1000;
+            let is_stale = age_secs > STALE_AFTER_SECS;
+
+            if is_stale {
+                // Enqueue refresh (deduped)
+                if let Ok(created) =
+                    refresh_jobs::enqueue_or_requeue(&state.mongo.db, &request_key).await
+                {
+                    // IMPORTANT: keep snapshot state consistent with job queue
+                    if created {
+                        let _ =
+                            snapshots::set_refresh_state(&state.mongo.db, &request_key, "queued")
+                                .await;
+                    }
+                }
+            }
+
+            Json(BalanceResponse {
+                status: true,
+                result: doc.result,
+            })
+        }
+
+        // ============================
+        // CASE 2: Snapshot does not exist
+        // ============================
+        Ok(None) => {
+            let normalized_json = serde_json::to_value(&normalized).unwrap_or(json!({}));
+            let empty_result = empty_legacy_result();
+
+            // Create empty snapshot
+            let _ = snapshots::upsert_empty_snapshot(
+                &state.mongo.db,
+                &request_key,
+                normalized_json,
+                empty_result.clone(),
+            )
+            .await;
+
+            // Enqueue refresh job
+            if let Ok(created) =
+                refresh_jobs::enqueue_or_requeue(&state.mongo.db, &request_key).await
+            {
+                if created {
+                    let _ =
+                        snapshots::set_refresh_state(&state.mongo.db, &request_key, "queued").await;
+                }
+            }
+
+            Json(BalanceResponse {
+                status: true,
+                result: empty_result,
+            })
+        }
+
+        // ============================
+        // CASE 3: DB error → fail soft
+        // ============================
+        Err(_) => Json(BalanceResponse {
+            status: true,
+            result: empty_legacy_result(),
+        }),
+    }
+}
+
+
+
+==================================================
+FILE: D:\Learn\rust\balance-service\src\http\mod.rs
+==================================================
+
+pub mod dto;
+pub mod handlers;
+
+
+
+==================================================
+FILE: D:\Learn\rust\balance-service\src\main.rs
+==================================================
+
+mod config;
+mod core;
+mod db;
+mod http;
+mod worker;
+
+use axum::{
+    routing::{get, post},
+    Router,
+};
+use config::AppConfig;
+use db::mongo::Mongo;
+use std::sync::Arc;
+use tracing_subscriber::EnvFilter;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub cfg: AppConfig,
+    pub mongo: Arc<Mongo>,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), anyhow::Error> {
+    dotenvy::dotenv().ok();
+
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .json()
+        .init();
+
+    let cfg = AppConfig::from_env()?;
+    let mongo = Mongo::connect(&cfg).await?;
+
+    let _ = db::snapshots::ensure_indexes(&mongo.db).await;
+    let _ = db::refresh_jobs::ensure_indexes(&mongo.db).await;
+
+    let state = AppState {
+        cfg: cfg.clone(),
+        mongo: Arc::new(mongo),
+    };
+
+    let worker_state = state.clone();
+    tokio::spawn(async move {
+        worker::runner::run_worker(worker_state).await;
+    });
+
+    let app = Router::new()
+        .route("/health", get(http::handlers::health))
+        .route(
+            "/wallet/get-multi-wallet-balances",
+            post(http::handlers::get_multi_wallet_balances),
+        )
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;
+    tracing::info!("listening on {}", cfg.bind_addr);
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+
+
+==================================================
+FILE: D:\Learn\rust\balance-service\src\tests\Cargo.toml
+==================================================
+
+[package]
+name = "tests"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+
+
+==================================================
+FILE: D:\Learn\rust\balance-service\src\tests\mod.rs
+==================================================
+
+
+
+
+==================================================
+FILE: D:\Learn\rust\balance-service\src\tests\src\main.rs
+==================================================
+
+fn main() {
+    println!("Hello, world!");
+}
+
+
+
+==================================================
+FILE: D:\Learn\rust\balance-service\src\worker\mod.rs
+==================================================
+
+pub mod runner;
+
+
+
+==================================================
+FILE: D:\Learn\rust\balance-service\src\worker\runner.rs
+==================================================
+
+// use crate::AppState;
+// use bson::{doc, DateTime};
+// use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
+
+// pub async fn run_worker(state: AppState) {
+//     let poll_ms = state.cfg.worker_poll_ms;
+//     tracing::info!("worker started (poll_ms={})", poll_ms);
+
+//     loop {
+//         if !state.cfg.worker_enabled {
+//             tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+//             continue;
+//         }
+
+//         match claim_next_job(&state).await {
+//             Ok(Some(request_key)) => {
+//                 let res = process_job(&state, &request_key).await;
+//                 if let Err(e) = res {
+//                     tracing::error!(request_key=%request_key, error=%e, "job failed");
+//                     let _ = mark_job_failed(&state, &request_key).await;
+//                 }
+//             }
+//             Ok(None) => {
+//                 tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
+//             }
+//             Err(e) => {
+//                 tracing::error!(error=%e, "worker claim error");
+//                 tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+//             }
+//         }
+//     }
+// }
+
+// async fn claim_next_job(state: &AppState) -> Result<Option<String>, mongodb::error::Error> {
+//     let coll = state
+//         .mongo
+//         .db
+//         .collection::<bson::Document>("balance_refresh_jobs");
+//     let now = DateTime::now();
+
+//     // Claim one job that is queued and either no nextRetryAt or nextRetryAt <= now
+//     let filter = doc! {
+//         "status": "queued",
+//         "$or": [
+//             { "nextRetryAt": bson::Bson::Null },
+//             { "nextRetryAt": { "$lte": now } }
+//         ]
+//     };
+
+//     let update = doc! {
+//         "$set": { "status": "running", "updatedAt": now }
+//     };
+
+//     let opts = FindOneAndUpdateOptions::builder()
+//         .sort(doc! { "createdAt": 1 })
+//         .return_document(ReturnDocument::After)
+//         .build();
+
+//     let doc_opt = coll
+//         .find_one_and_update(filter, update)
+//         .with_options(opts)
+//         .await?;
+//     Ok(doc_opt.and_then(|d| d.get_str("requestKey").ok().map(|s| s.to_string())))
+// }
+
+// async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::Error> {
+//     // 1) Mark snapshot refreshState=running (optional but nice)
+//     let snapshots = state
+//         .mongo
+//         .db
+//         .collection::<bson::Document>("balance_snapshots");
+//     let now = DateTime::now();
+
+//     let _ = snapshots
+//         .update_one(
+//             doc! { "requestKey": request_key },
+//             doc! { "$set": { "refreshState": "running" } },
+//         )
+//         .await?;
+
+//     // 2) Dummy "refresh": update lastUpdatedAt and write a marker into result.total.balance
+//     // This proves pipeline works; later replaced with real RPC refresh.
+//     let marker = format!("dummy-refresh-{}", now.timestamp_millis());
+
+//     let _ = snapshots
+//         .update_one(
+//             doc! { "requestKey": request_key },
+//             doc! {
+//                 "$set": {
+//                     "lastUpdatedAt": now,
+//                     "refreshState": "idle",
+//                     "result.total.balance.__refresh_marker": marker
+//                 }
+//             },
+//         )
+//         .await?;
+
+//     // 3) Mark job done
+//     let jobs = state
+//         .mongo
+//         .db
+//         .collection::<bson::Document>("balance_refresh_jobs");
+//     let _ = jobs
+//         .update_one(
+//             doc! { "requestKey": request_key },
+//             doc! { "$set": { "status": "done", "updatedAt": now } },
+//         )
+//         .await?;
+
+//     Ok(())
+// }
+
+// async fn mark_job_failed(state: &AppState, request_key: &str) -> Result<(), mongodb::error::Error> {
+//     let jobs = state
+//         .mongo
+//         .db
+//         .collection::<bson::Document>("balance_refresh_jobs");
+//     let now = DateTime::now();
+
+//     // backoff: attempts * 5 seconds (cap later)
+//     let job = jobs.find_one(doc! { "requestKey": request_key }).await?;
+//     let attempts = job
+//         .as_ref()
+//         .and_then(|d| d.get_i32("attempts").ok())
+//         .unwrap_or(0)
+//         + 1;
+
+//     let backoff_secs = (attempts as i64) * 5;
+//     let next_retry_ms = now.timestamp_millis() + backoff_secs * 1000;
+//     let next_retry = DateTime::from_millis(next_retry_ms);
+
+//     jobs.update_one(
+//         doc! { "requestKey": request_key },
+//         doc! {
+//             "$set": {
+//                 "status": "queued",
+//                 "updatedAt": now,
+//                 "nextRetryAt": next_retry
+//             },
+//             "$setOnInsert": { "createdAt": now },
+//             "$inc": { "attempts": 1 }
+//         },
+//     )
+//     .await?;
+
+//     Ok(())
+// }
+
+use crate::AppState;
+use bson::{doc, DateTime};
+use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
+
+pub async fn run_worker(state: AppState) {
+    let poll_ms = state.cfg.worker_poll_ms;
+    tracing::info!("worker started (poll_ms={})", poll_ms);
+
+    loop {
+        if !state.cfg.worker_enabled {
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            continue;
+        }
+
+        match claim_next_job(&state).await {
+            Ok(Some(request_key)) => {
+                let res = process_job(&state, &request_key).await;
+                if let Err(e) = res {
+                    tracing::error!(request_key=%request_key, error=%e, "job failed");
+                    let _ = mark_job_failed(&state, &request_key).await;
+                }
+            }
+            Ok(None) => {
+                tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
+            }
+            Err(e) => {
+                tracing::error!(error=%e, "worker claim error");
+                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            }
+        }
+    }
+}
+
+async fn claim_next_job(state: &AppState) -> Result<Option<String>, mongodb::error::Error> {
+    let coll = state
+        .mongo
+        .db
+        .collection::<bson::Document>("balance_refresh_jobs");
+    let now = DateTime::now();
+
+    let filter = doc! {
+        "status": "queued",
+        "$or": [
+            { "nextRetryAt": bson::Bson::Null },
+            { "nextRetryAt": { "$lte": now } }
+        ]
+    };
+
+    let update = doc! {
+        "$set": { "status": "running", "updatedAt": now }
+    };
+
+    let opts = FindOneAndUpdateOptions::builder()
+        .sort(doc! { "createdAt": 1 })
+        .return_document(ReturnDocument::After)
+        .build();
+
+    let doc_opt = coll
+        .find_one_and_update(filter, update)
+        .with_options(opts)
+        .await?;
+
+    Ok(doc_opt.and_then(|d| d.get_str("requestKey").ok().map(|s| s.to_string())))
+}
+
+async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::Error> {
+    let snapshots = state
+        .mongo
+        .db
+        .collection::<bson::Document>("balance_snapshots");
+    let now = DateTime::now();
+
+    // mark running
+    snapshots
+        .update_one(
+            doc! { "requestKey": request_key },
+            doc! { "$set": { "refreshState": "running" } },
+        )
+        .await?;
+
+    // dummy refresh marker
+    let marker = format!("dummy-refresh-{}", now.timestamp_millis());
+
+    snapshots
+        .update_one(
+            doc! { "requestKey": request_key },
+            doc! {
+                "$set": {
+                    "lastUpdatedAt": now,
+                    "refreshState": "idle",
+                    "result.total.balance.__refresh_marker": marker
+                }
+            },
+        )
+        .await?;
+
+    // mark job done
+    let jobs = state
+        .mongo
+        .db
+        .collection::<bson::Document>("balance_refresh_jobs");
+
+    jobs.update_one(
+        doc! { "requestKey": request_key },
+        doc! { "$set": { "status": "done", "updatedAt": now } },
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn mark_job_failed(state: &AppState, request_key: &str) -> Result<(), mongodb::error::Error> {
+    let jobs = state
+        .mongo
+        .db
+        .collection::<bson::Document>("balance_refresh_jobs");
+    let now = DateTime::now();
+
+    let job = jobs.find_one(doc! { "requestKey": request_key }).await?;
+    let attempts = job
+        .as_ref()
+        .and_then(|d| d.get_i32("attempts").ok())
+        .unwrap_or(0)
+        + 1;
+
+    let backoff_secs = (attempts as i64) * 5;
+    let next_retry_ms = now.timestamp_millis() + backoff_secs * 1000;
+    let next_retry = DateTime::from_millis(next_retry_ms);
+
+    jobs.update_one(
+        doc! { "requestKey": request_key },
+        doc! {
+            "$set": {
+                "status": "queued",
+                "updatedAt": now,
+                "nextRetryAt": next_retry
+            },
+            "$setOnInsert": { "createdAt": now },
+            "$inc": { "attempts": 1 }
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+
+

@@ -1,0 +1,23 @@
+use bson::DateTime;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceSnapshotDoc {
+    pub request_key: String,
+    pub normalized_request: serde_json::Value,
+    pub result: serde_json::Value,
+    pub last_updated_at: DateTime,
+    pub refresh_state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceRefreshJobDoc {
+    pub request_key: String,
+    pub status: String, // queued | running | done | failed
+    pub attempts: i32,
+    pub next_retry_at: Option<DateTime>,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
