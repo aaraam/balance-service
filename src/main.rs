@@ -3,6 +3,8 @@ mod core;
 mod db;
 mod http;
 mod worker;
+mod chains;
+mod evm;
 
 use axum::{
     routing::{get, post},

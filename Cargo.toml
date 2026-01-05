@@ -24,3 +24,8 @@ thiserror = "1.0"
 time = { version = "0.3", features = ["macros"] }
 
 anyhow = "1.0"
+
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+ethabi = "18"
+ethereum-types = "0.14"
+
