@@ -24,8 +24,15 @@ pub async fn get_multi_wallet_balances(
 
     tracing::info!(
         request_key = %request_key,
-        wallets = ?normalized.walletAddresses,
-        contracts = ?normalized.contracts.iter().map(|c| (&c.networkName, c.contractAddresses.len())).collect::<Vec<_>>(),
+        hard_refresh = normalized.hard_refresh,
+        evm_wallets = normalized.wallet_addresses.len(),
+        sol_wallets = normalized.solana_wallet_addresses.len(),
+        doge_wallets = normalized.doge_wallet_addresses.len(),
+        btc_wallets = normalized.btc_wallet_addresses.len(),
+        contracts = ?normalized.contracts
+            .iter()
+            .map(|c| (&c.network_name, c.contract_addresses.len()))
+            .collect::<Vec<_>>(),
         "balances request received"
     );
 
@@ -45,7 +52,8 @@ pub async fn get_multi_wallet_balances(
                 "snapshot hit"
             );
 
-            if is_stale {
+            // Phase 2+ behavior: if hard_refresh true, enqueue regardless of staleness
+            if is_stale || normalized.hard_refresh {
                 match refresh_jobs::enqueue_or_requeue(&state.mongo.db, &request_key).await {
                     Ok(did_queue) => {
                         tracing::info!(
@@ -61,11 +69,18 @@ pub async fn get_multi_wallet_balances(
                                 "queued",
                             )
                             .await;
-                            tracing::debug!(request_key=%request_key, "snapshot refreshState set to queued");
+                            tracing::debug!(
+                                request_key=%request_key,
+                                "snapshot refreshState set to queued"
+                            );
                         }
                     }
                     Err(e) => {
-                        tracing::error!(request_key=%request_key, error=%e, "failed to enqueue refresh job");
+                        tracing::error!(
+                            request_key=%request_key,
+                            error=%e,
+                            "failed to enqueue refresh job"
+                        );
                     }
                 }
             }
@@ -77,7 +92,10 @@ pub async fn get_multi_wallet_balances(
         }
 
         Ok(None) => {
-            tracing::info!(request_key=%request_key, "snapshot miss → creating empty snapshot + enqueue job");
+            tracing::info!(
+                request_key=%request_key,
+                "snapshot miss → creating empty snapshot + enqueue job"
+            );
 
             let normalized_json = serde_json::to_value(&normalized).unwrap_or(json!({}));
             let empty_result = empty_legacy_result();
@@ -90,23 +108,38 @@ pub async fn get_multi_wallet_balances(
             )
             .await
             {
-                tracing::error!(request_key=%request_key, error=%e, "failed to upsert empty snapshot");
+                tracing::error!(
+                    request_key=%request_key,
+                    error=%e,
+                    "failed to upsert empty snapshot"
+                );
             } else {
                 tracing::debug!(request_key=%request_key, "empty snapshot upserted");
             }
 
             match refresh_jobs::enqueue_or_requeue(&state.mongo.db, &request_key).await {
                 Ok(did_queue) => {
-                    tracing::info!(request_key=%request_key, did_queue=did_queue, "refresh job enqueue_or_requeue result");
+                    tracing::info!(
+                        request_key=%request_key,
+                        did_queue=did_queue,
+                        "refresh job enqueue_or_requeue result"
+                    );
 
                     if did_queue {
                         let _ =
                             snapshots::set_refresh_state(&state.mongo.db, &request_key, "queued")
                                 .await;
-                        tracing::debug!(request_key=%request_key, "snapshot refreshState set to queued");
+                        tracing::debug!(
+                            request_key=%request_key,
+                            "snapshot refreshState set to queued"
+                        );
                     }
                 }
-                Err(e) => tracing::error!(request_key=%request_key, error=%e, "failed to enqueue refresh job"),
+                Err(e) => tracing::error!(
+                    request_key=%request_key,
+                    error=%e,
+                    "failed to enqueue refresh job"
+                ),
             }
 
             Json(BalanceResponse {
@@ -116,7 +149,11 @@ pub async fn get_multi_wallet_balances(
         }
 
         Err(e) => {
-            tracing::error!(request_key=%request_key, error=%e, "snapshot fetch error (fail-soft)");
+            tracing::error!(
+                request_key=%request_key,
+                error=%e,
+                "snapshot fetch error (fail-soft)"
+            );
             Json(BalanceResponse {
                 status: true,
                 result: empty_legacy_result(),

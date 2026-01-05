@@ -12,6 +12,9 @@ pub struct AppConfig {
 
     // NEW: slows down processing so you can SEE logs/state changes
     pub worker_slow_ms: u64,
+
+    // Thirdweb
+    pub thirdweb_client_id: String,
 }
 
 #[derive(Debug, Error)]
@@ -29,6 +32,9 @@ impl AppConfig {
 
         let mongodb_db_main = std::env::var("MONGODB_DB_MAIN")
             .map_err(|_| ConfigError::MissingEnv("MONGODB_DB_MAIN"))?;
+
+        let thirdweb_client_id = std::env::var("THIRD_WEB_CLIENT_ID")
+            .map_err(|_| ConfigError::MissingEnv("THIRD_WEB_CLIENT_ID"))?;
 
         // optional env vars
         let worker_enabled = std::env::var("WORKER_ENABLED")
@@ -50,6 +56,7 @@ impl AppConfig {
             bind_addr,
             mongodb_uri,
             mongodb_db_main,
+            thirdweb_client_id,
             worker_enabled,
             worker_poll_ms,
             worker_slow_ms,
