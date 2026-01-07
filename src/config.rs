@@ -15,42 +15,73 @@ pub struct AppConfig {
 
     // Thirdweb
     pub thirdweb_client_id: String,
+
+    // Solana
+    pub solana_rpc_url: String,
+
+    // NEW: Solana worker tuning
+    pub sol_worker_wallet_parallelism: usize,
+    pub sol_worker_rpc_concurrency: usize,
 }
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("missing env var: {0}")]
-    MissingEnv(&'static str),
+    #[error("missing env var: {0}")] MissingEnv(&'static str),
 }
 
 impl AppConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
         let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
 
-        let mongodb_uri =
-            std::env::var("MONGODB_URI").map_err(|_| ConfigError::MissingEnv("MONGODB_URI"))?;
+        let mongodb_uri = std::env
+            ::var("MONGODB_URI")
+            .map_err(|_| ConfigError::MissingEnv("MONGODB_URI"))?;
 
-        let mongodb_db_main = std::env::var("MONGODB_DB_MAIN")
+        let mongodb_db_main = std::env
+            ::var("MONGODB_DB_MAIN")
             .map_err(|_| ConfigError::MissingEnv("MONGODB_DB_MAIN"))?;
 
-        let thirdweb_client_id = std::env::var("THIRD_WEB_CLIENT_ID")
+        let thirdweb_client_id = std::env
+            ::var("THIRD_WEB_CLIENT_ID")
             .map_err(|_| ConfigError::MissingEnv("THIRD_WEB_CLIENT_ID"))?;
 
         // optional env vars
-        let worker_enabled = std::env::var("WORKER_ENABLED")
+        let worker_enabled = std::env
+            ::var("WORKER_ENABLED")
             .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .map(|v| (v == "1" || v.eq_ignore_ascii_case("true")))
             .unwrap_or(true);
 
-        let worker_poll_ms = std::env::var("WORKER_POLL_MS")
+        let worker_poll_ms = std::env
+            ::var("WORKER_POLL_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(500);
 
-        let worker_slow_ms = std::env::var("WORKER_SLOW_MS")
+        let worker_slow_ms = std::env
+            ::var("WORKER_SLOW_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
+
+        // Solana RPC (IMPORTANT: env var is SOLANA_RPC_URL)
+        // Your screenshot shows SOLANA_RPC_KEY - that will be ignored.
+        let solana_rpc_url = std::env
+            ::var("SOLANA_RPC_URL")
+            .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+
+        // NEW: Solana worker concurrency
+        let sol_worker_wallet_parallelism = std::env
+            ::var("SOL_WORKER_WALLET_PARALLELISM")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(8);
+
+        let sol_worker_rpc_concurrency = std::env
+            ::var("SOL_WORKER_RPC_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(32);
 
         Ok(Self {
             bind_addr,
@@ -60,6 +91,9 @@ impl AppConfig {
             worker_enabled,
             worker_poll_ms,
             worker_slow_ms,
+            solana_rpc_url,
+            sol_worker_wallet_parallelism,
+            sol_worker_rpc_concurrency,
         })
     }
 }

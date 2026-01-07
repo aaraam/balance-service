@@ -5,11 +5,9 @@ mod http;
 mod worker;
 mod chains;
 mod evm;
+mod sol;
 
-use axum::{
-    routing::{get, post},
-    Router,
-};
+use axum::{ routing::{ get, post }, Router };
 use config::AppConfig;
 use db::mongo::Mongo;
 use std::sync::Arc;
@@ -25,10 +23,7 @@ pub struct AppState {
 async fn main() -> Result<(), anyhow::Error> {
     dotenvy::dotenv().ok();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .json()
-        .init();
+    tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).json().init();
 
     let cfg = AppConfig::from_env()?;
     let mongo = Mongo::connect(&cfg).await?;
@@ -36,22 +31,30 @@ async fn main() -> Result<(), anyhow::Error> {
     let _ = db::snapshots::ensure_indexes(&mongo.db).await;
     let _ = db::refresh_jobs::ensure_indexes(&mongo.db).await;
 
+    // NEW: sol indexes
+    let _ = db::sol_snapshots::ensure_indexes(&mongo.db).await;
+    let _ = db::sol_refresh_jobs::ensure_indexes(&mongo.db).await;
+
     let state = AppState {
         cfg: cfg.clone(),
         mongo: Arc::new(mongo),
     };
 
+    // EVM worker
     let worker_state = state.clone();
     tokio::spawn(async move {
         worker::runner::run_worker(worker_state).await;
     });
 
+    // SOL worker (separate pipeline)
+    let sol_worker_state = state.clone();
+    tokio::spawn(async move {
+        worker::sol_runner::run_sol_worker(sol_worker_state).await;
+    });
+
     let app = Router::new()
         .route("/health", get(http::handlers::health))
-        .route(
-            "/wallet/get-multi-wallet-balances",
-            post(http::handlers::get_multi_wallet_balances),
-        )
+        .route("/wallet/get-multi-wallet-balances", post(http::handlers::get_multi_wallet_balances))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;
