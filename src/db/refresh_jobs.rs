@@ -47,7 +47,7 @@
 // }
 
 use crate::db::models::BalanceRefreshJobDoc;
-use bson::{ doc, DateTime };
+use bson::{doc, DateTime};
 use mongodb::Collection;
 
 pub fn refresh_jobs_collection(db: &mongodb::Database) -> Collection<BalanceRefreshJobDoc> {
@@ -55,7 +55,7 @@ pub fn refresh_jobs_collection(db: &mongodb::Database) -> Collection<BalanceRefr
 }
 
 pub async fn ensure_indexes(db: &mongodb::Database) -> Result<(), mongodb::error::Error> {
-    use mongodb::{ options::IndexOptions, IndexModel };
+    use mongodb::{options::IndexOptions, IndexModel};
 
     let coll = refresh_jobs_collection(db);
 
@@ -77,7 +77,7 @@ pub async fn ensure_indexes(db: &mongodb::Database) -> Result<(), mongodb::error
 /// - Ok(false) if job already queued/running and we did nothing
 pub async fn enqueue_or_requeue(
     db: &mongodb::Database,
-    request_key: &str
+    request_key: &str,
 ) -> Result<bool, mongodb::error::Error> {
     let coll = refresh_jobs_collection(db);
     let now = DateTime::now();
@@ -98,7 +98,10 @@ pub async fn enqueue_or_requeue(
         }
     };
 
-    let requeue_result = coll.update_one(requeue_filter, requeue_update).upsert(false).await?;
+    let requeue_result = coll
+        .update_one(requeue_filter, requeue_update)
+        .upsert(false)
+        .await?;
     tracing::debug!(
         request_key=%request_key,
         matched=?requeue_result.matched_count,
@@ -123,7 +126,10 @@ pub async fn enqueue_or_requeue(
         }
     };
 
-    let insert_result = coll.update_one(insert_filter, insert_update).upsert(true).await?;
+    let insert_result = coll
+        .update_one(insert_filter, insert_update)
+        .upsert(true)
+        .await?;
     let did_insert = insert_result.upserted_id.is_some();
 
     tracing::info!(
@@ -136,4 +142,3 @@ pub async fn enqueue_or_requeue(
 
     Ok(did_insert)
 }
-

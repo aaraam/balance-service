@@ -1,10 +1,11 @@
+mod chains;
 mod config;
 mod core;
 mod db;
-mod http;
-mod worker;
-mod chains;
 mod evm;
+mod http;
+mod solana;
+mod worker;
 
 use axum::{
     routing::{get, post},

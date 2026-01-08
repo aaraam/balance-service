@@ -31,12 +31,7 @@ impl RpcClient {
             ]
         });
 
-        let res = self
-            .http
-            .post(&self.rpc_url)
-            .json(&payload)
-            .send()
-            .await?;
+        let res = self.http.post(&self.rpc_url).json(&payload).send().await?;
 
         let status = res.status();
         let v: serde_json::Value = res.json().await?;

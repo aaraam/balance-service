@@ -15,6 +15,9 @@ pub struct AppConfig {
 
     // Thirdweb
     pub thirdweb_client_id: String,
+
+    // Solana (native SOL only for now)
+    pub solana_rpc_url: String,
 }
 
 #[derive(Debug, Error)]
@@ -39,7 +42,7 @@ impl AppConfig {
         // optional env vars
         let worker_enabled = std::env::var("WORKER_ENABLED")
             .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .map(|v| (v == "1" || v.eq_ignore_ascii_case("true")))
             .unwrap_or(true);
 
         let worker_poll_ms = std::env::var("WORKER_POLL_MS")
@@ -52,6 +55,9 @@ impl AppConfig {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
 
+        let solana_rpc_url = std::env::var("SOLANA_RPC_URL")
+            .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+
         Ok(Self {
             bind_addr,
             mongodb_uri,
@@ -60,6 +66,7 @@ impl AppConfig {
             worker_enabled,
             worker_poll_ms,
             worker_slow_ms,
+            solana_rpc_url,
         })
     }
 }

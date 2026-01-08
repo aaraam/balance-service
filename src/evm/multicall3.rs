@@ -125,7 +125,7 @@ fn u256_from_return_data(bytes: &[u8]) -> U256 {
 }
 
 pub struct EvmBalances {
-    pub native: HashMap<String, U256>,                // wallet -> native
+    pub native: HashMap<String, U256>, // wallet -> native
     pub erc20: HashMap<String, HashMap<String, U256>>, // wallet -> token -> bal
 }
 
@@ -318,7 +318,10 @@ pub async fn fetch_balances_multicall3(
                 }
                 "erc20" => {
                     let token = meta.token.clone().unwrap();
-                    erc20.entry(meta.wallet.clone()).or_default().insert(token, value);
+                    erc20
+                        .entry(meta.wallet.clone())
+                        .or_default()
+                        .insert(token, value);
                 }
                 _ => {}
             }
