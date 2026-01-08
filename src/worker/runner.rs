@@ -4,18 +4,23 @@
 
 use crate::AppState;
 use anyhow::anyhow;
-use bson::{doc, DateTime};
-use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
+use bson::{ doc, DateTime };
+use mongodb::options::{ FindOneAndUpdateOptions, ReturnDocument };
 use serde_json::json;
 
-use crate::chains::{is_ignored_network, supported_evm_networks};
+use crate::chains::{ is_ignored_network, supported_evm_networks };
 use crate::evm::format::u256_to_decimal_string;
 use crate::evm::multicall3::{
-    fetch_balances_multicall3, fetch_token_decimals_multicall3, EvmBalances,
+    fetch_balances_multicall3,
+    fetch_token_decimals_multicall3,
+    EvmBalances,
 };
 use crate::evm::rpc::RpcClient;
-use crate::http::dto::{zero_result_from_request, BalanceRequest};
+use crate::http::dto::{ zero_result_from_request, BalanceRequest };
 use crate::solana::rpc::SolanaRpcClient;
+
+use std::sync::atomic::{ AtomicU64, Ordering };
+use std::time::Instant;
 
 const MAX_CALLS_PER_BATCH: usize = 600;
 
@@ -24,6 +29,17 @@ const NATIVE_DECIMALS: u32 = 18;
 
 // SOL uses 9 decimals (lamports). We output 18-decimal fixed strings.
 const SOL_DECIMALS: u32 = 9;
+
+// --- ultra-light metrics (process-local) ---
+static JOBS_CLAIMED: AtomicU64 = AtomicU64::new(0);
+static JOBS_DONE: AtomicU64 = AtomicU64::new(0);
+static JOBS_FAILED: AtomicU64 = AtomicU64::new(0);
+
+static EVM_NET_OK: AtomicU64 = AtomicU64::new(0);
+static EVM_NET_FAIL: AtomicU64 = AtomicU64::new(0);
+
+static SOL_NET_OK: AtomicU64 = AtomicU64::new(0);
+static SOL_NET_FAIL: AtomicU64 = AtomicU64::new(0);
 
 fn native_symbol_for(network: &str) -> &str {
     match network {
@@ -35,35 +51,69 @@ fn native_symbol_for(network: &str) -> &str {
     }
 }
 
-// Convert lamports -> fixed 18-decimal SOL string.
-// Example: 1 lamport => 0.000000001000000000
-fn lamports_to_sol_fixed_18(lamports: u64) -> String {
-    // base-decimals = 9
-    let whole = lamports / 1_000_000_000;
-    let frac = lamports % 1_000_000_000;
-
-    let mut frac_str = frac.to_string();
-    if frac_str.len() < (SOL_DECIMALS as usize) {
-        let pad = "0".repeat((SOL_DECIMALS as usize) - frac_str.len());
-        frac_str = format!("{}{}", pad, frac_str);
+// Convert base-units (u128) to fixed-decimals string, then pad to 18 decimals.
+// - `decimals` is the asset decimals (e.g., SOL=9, USDC=6, SPL mint decimals vary)
+// - output is fixed 18 decimals (no trim)
+fn u128_base_units_to_fixed_18(value: u128, decimals: u32) -> String {
+    if decimals == 0 {
+        return format!("{}.{}", value, "0".repeat(18));
     }
 
-    // now pad to 18 decimals by adding zeros to the right
-    // (keeps numeric value identical, just higher fixed precision)
-    let extra = (18 - SOL_DECIMALS) as usize;
-    frac_str.push_str(&"0".repeat(extra));
+    // if decimals > 18, we still output 18 decimals by truncating extra precision
+    // (rare on SPL; but we stay consistent)
+    let out_decimals: u32 = 18;
+
+    // Build as string via division to avoid overflow from pow10
+    // Compute whole and fractional in base `10^decimals` using string-safe pow10 as u128 where possible
+    let pow = (10u128)
+        .checked_pow(decimals.min(38)) // safe-ish clamp for u128
+        .unwrap_or(u128::MAX);
+
+    // If decimals is too large to pow safely, fall back to string slicing on full number
+    if pow == u128::MAX && decimals > 38 {
+        // absurd case; just emit 0-ish but honest
+        return format!("0.{}", "0".repeat(18));
+    }
+
+    let whole = if pow == 0 { 0 } else { value / pow };
+    let frac = if pow == 0 { 0 } else { value % pow };
+
+    let mut frac_str = frac.to_string();
+    let dec_usize = decimals as usize;
+    if frac_str.len() < dec_usize {
+        frac_str = format!("{}{}", "0".repeat(dec_usize - frac_str.len()), frac_str);
+    }
+
+    if out_decimals > decimals {
+        // pad right with zeros to reach 18
+        frac_str.push_str(&"0".repeat((out_decimals - decimals) as usize));
+    } else if out_decimals < decimals {
+        // truncate to 18
+        frac_str.truncate(out_decimals as usize);
+    }
 
     format!("{}.{}", whole, frac_str)
+}
+
+// Convert lamports(u128) -> fixed 18-decimal SOL string.
+// Example: 1 lamport => 0.000000001000000000
+fn lamports_u128_to_sol_fixed_18(lamports: u128) -> String {
+    // lamports decimals = 9
+    u128_base_units_to_fixed_18(lamports, SOL_DECIMALS)
+}
+
+fn sol_mints_from_request(req: &BalanceRequest) -> Vec<String> {
+    req.contracts
+        .iter()
+        .find(|c| c.network_name == "sol")
+        .map(|c| c.contract_addresses.clone())
+        .unwrap_or_default()
 }
 
 pub async fn run_worker(state: AppState) {
     let poll_ms = state.cfg.worker_poll_ms;
 
-    tracing::info!(
-        worker_enabled = state.cfg.worker_enabled,
-        poll_ms = poll_ms,
-        "worker started"
-    );
+    tracing::info!(worker_enabled = state.cfg.worker_enabled, poll_ms = poll_ms, "worker started");
 
     loop {
         if !state.cfg.worker_enabled {
@@ -73,12 +123,39 @@ pub async fn run_worker(state: AppState) {
 
         match claim_next_job(&state).await {
             Ok(Some(request_key)) => {
-                tracing::info!(request_key = %request_key, "claimed job");
+                JOBS_CLAIMED.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
+                    request_key = %request_key,
+                    jobs_claimed = JOBS_CLAIMED.load(Ordering::Relaxed),
+                    "claimed job"
+                );
 
+                let job_start = Instant::now();
                 let res = process_job(&state, &request_key).await;
-                if let Err(e) = res {
-                    tracing::error!(request_key = %request_key, error = %e, "job failed");
-                    let _ = mark_job_failed(&state, &request_key).await;
+
+                match res {
+                    Ok(_) => {
+                        JOBS_DONE.fetch_add(1, Ordering::Relaxed);
+                        tracing::info!(
+                            request_key = %request_key,
+                            elapsed_ms = job_start.elapsed().as_millis(),
+                            jobs_done = JOBS_DONE.load(Ordering::Relaxed),
+                            jobs_failed = JOBS_FAILED.load(Ordering::Relaxed),
+                            "job done"
+                        );
+                    }
+                    Err(e) => {
+                        JOBS_FAILED.fetch_add(1, Ordering::Relaxed);
+                        tracing::error!(
+                            request_key = %request_key,
+                            elapsed_ms = job_start.elapsed().as_millis(),
+                            error = %e,
+                            jobs_done = JOBS_DONE.load(Ordering::Relaxed),
+                            jobs_failed = JOBS_FAILED.load(Ordering::Relaxed),
+                            "job failed"
+                        );
+                        let _ = mark_job_failed(&state, &request_key).await;
+                    }
                 }
             }
             Ok(None) => {
@@ -93,13 +170,11 @@ pub async fn run_worker(state: AppState) {
 }
 
 async fn claim_next_job(state: &AppState) -> Result<Option<String>, mongodb::error::Error> {
-    let coll = state
-        .mongo
-        .db
-        .collection::<bson::Document>("balance_refresh_jobs");
+    let coll = state.mongo.db.collection::<bson::Document>("balance_refresh_jobs");
     let now = DateTime::now();
 
-    let filter = doc! {
+    let filter =
+        doc! {
         "status": "queued",
         "$or": [
             { "nextRetryAt": bson::Bson::Null },
@@ -116,45 +191,42 @@ async fn claim_next_job(state: &AppState) -> Result<Option<String>, mongodb::err
         .return_document(ReturnDocument::After)
         .build();
 
-    let doc_opt = coll
-        .find_one_and_update(filter, update)
-        .with_options(opts)
-        .await?;
+    let doc_opt = coll.find_one_and_update(filter, update).with_options(opts).await?;
 
-    Ok(doc_opt.and_then(|d| d.get_str("requestKey").ok().map(|s| s.to_string())))
+    Ok(
+        doc_opt.and_then(|d|
+            d
+                .get_str("requestKey")
+                .ok()
+                .map(|s| s.to_string())
+        )
+    )
 }
 
 async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::Error> {
-    let snapshots = state
-        .mongo
-        .db
-        .collection::<bson::Document>("balance_snapshots");
+    let snapshots = state.mongo.db.collection::<bson::Document>("balance_snapshots");
     let now = DateTime::now();
 
     // Mark snapshot running
-    snapshots
-        .update_one(
-            doc! { "requestKey": request_key },
-            doc! { "$set": { "refreshState": "running" } },
-        )
-        .await?;
+    snapshots.update_one(
+        doc! { "requestKey": request_key },
+        doc! { "$set": { "refreshState": "running" } }
+    ).await?;
 
     // Load normalized request
     let snap = snapshots
-        .find_one(doc! { "requestKey": request_key })
-        .await?
+        .find_one(doc! { "requestKey": request_key }).await?
         .ok_or_else(|| anyhow!("snapshot not found for requestKey"))?;
 
-    let normalized_req_bson = snap
-        .get("normalizedRequest")
-        .cloned()
-        .unwrap_or(bson::Bson::Null);
+    let normalized_req_bson = snap.get("normalizedRequest").cloned().unwrap_or(bson::Bson::Null);
 
-    let normalized_req_json: serde_json::Value =
-        bson::from_bson(normalized_req_bson).unwrap_or_else(|_| json!({}));
+    let normalized_req_json: serde_json::Value = bson
+        ::from_bson(normalized_req_bson)
+        .unwrap_or_else(|_| json!({}));
 
-    let req: BalanceRequest =
-        serde_json::from_value(normalized_req_json.clone()).unwrap_or_else(|_| BalanceRequest {
+    let req: BalanceRequest = serde_json
+        ::from_value(normalized_req_json.clone())
+        .unwrap_or_else(|_| BalanceRequest {
             hard_refresh: false,
             contracts: vec![],
             wallet_addresses: vec![],
@@ -167,28 +239,30 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
     let mut final_result = zero_result_from_request(&req);
 
     // Row indices: data = [evm rows..., sol rows...]
-    let evm_wallet_index: std::collections::HashMap<String, usize> = req
-        .wallet_addresses
+    let evm_wallet_index: std::collections::HashMap<String, usize> = req.wallet_addresses
         .iter()
         .enumerate()
         .map(|(i, w)| (w.clone(), i))
         .collect();
 
     let sol_offset = req.wallet_addresses.len();
-    let sol_wallet_index: std::collections::HashMap<String, usize> = req
-        .solana_wallet_addresses
+    let sol_wallet_index: std::collections::HashMap<String, usize> = req.solana_wallet_addresses
         .iter()
         .enumerate()
         .map(|(i, w)| (w.clone(), sol_offset + i))
         .collect();
 
     // ==========================
-    // EVM processing (unchanged)
+    // EVM processing
     // ==========================
     let evm_map = supported_evm_networks();
 
     for cg in &req.contracts {
         let net = cg.network_name.as_str();
+
+        if net == "sol" {
+            continue;
+        }
 
         if is_ignored_network(net) {
             tracing::warn!(network=%net, "ignored network in contracts list");
@@ -200,31 +274,46 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             continue;
         };
 
+        let net_start = Instant::now();
+
         let rpc_url = chain.thirdweb_rpc_url(&state.cfg.thirdweb_client_id);
-        let rpc = RpcClient::new(rpc_url);
+        let rpc = RpcClient::new(rpc_url, state.cfg.rpc_timeout_ms);
 
-        let balances: EvmBalances = fetch_balances_multicall3(
-            &rpc,
-            &req.wallet_addresses,
-            &cg.contract_addresses,
-            MAX_CALLS_PER_BATCH,
-        )
-        .await
-        .unwrap_or_else(|e| {
-            tracing::error!(network=%net, error=%e, "evm fetch failed -> keeping zeros");
-            EvmBalances {
-                native: Default::default(),
-                erc20: Default::default(),
+        let balances: EvmBalances = match
+            fetch_balances_multicall3(
+                &rpc,
+                &req.wallet_addresses,
+                &cg.contract_addresses,
+                MAX_CALLS_PER_BATCH
+            ).await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                EVM_NET_FAIL.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    network=%net,
+                    error=%e,
+                    elapsed_ms=net_start.elapsed().as_millis(),
+                    evm_ok=EVM_NET_OK.load(Ordering::Relaxed),
+                    evm_fail=EVM_NET_FAIL.load(Ordering::Relaxed),
+                    "evm fetch failed -> keeping zeros"
+                );
+                EvmBalances {
+                    native: Default::default(),
+                    erc20: Default::default(),
+                }
             }
-        });
+        };
 
-        let decimals_map =
-            fetch_token_decimals_multicall3(&rpc, &cg.contract_addresses, MAX_CALLS_PER_BATCH)
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::error!(network=%net, error=%e, "decimals fetch failed -> default 18");
-                    std::collections::HashMap::new()
-                });
+        let decimals_map = match
+            fetch_token_decimals_multicall3(&rpc, &cg.contract_addresses, MAX_CALLS_PER_BATCH).await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!(network=%net, error=%e, "decimals fetch failed -> default 18");
+                std::collections::HashMap::new()
+            }
+        };
 
         for w in &req.wallet_addresses {
             let row_idx = *evm_wallet_index
@@ -237,9 +326,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                     .and_then(|v| v.as_array_mut())
                     .ok_or_else(|| anyhow!("final_result.data missing or not array"))?;
 
-                let row = data_arr
-                    .get_mut(row_idx)
-                    .ok_or_else(|| anyhow!("wallet row missing"))?;
+                let row = data_arr.get_mut(row_idx).ok_or_else(|| anyhow!("wallet row missing"))?;
 
                 let bal_obj = row
                     .get_mut("balance")
@@ -256,8 +343,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                 chain_obj.insert(native_symbol_for(net).to_string(), json!(native_str));
 
                 for token_addr in &cg.contract_addresses {
-                    let raw_bal = balances
-                        .erc20
+                    let raw_bal = balances.erc20
                         .get(w)
                         .and_then(|m| m.get(token_addr))
                         .cloned()
@@ -271,6 +357,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             }
         }
 
+        // totals
         let mut native_sum = ethereum_types::U256::zero();
         for w in &req.wallet_addresses {
             native_sum += balances.native.get(w).cloned().unwrap_or_default();
@@ -291,15 +378,14 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
 
             total_chain_obj.insert(
                 native_symbol_for(net).to_string(),
-                json!(u256_to_decimal_string(native_sum, NATIVE_DECIMALS, false)),
+                json!(u256_to_decimal_string(native_sum, NATIVE_DECIMALS, false))
             );
 
             for token_addr in &cg.contract_addresses {
                 let mut sum = ethereum_types::U256::zero();
 
                 for w in &req.wallet_addresses {
-                    let v = balances
-                        .erc20
+                    let v = balances.erc20
                         .get(w)
                         .and_then(|m| m.get(token_addr))
                         .cloned()
@@ -310,19 +396,48 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                 let dec = decimals_map.get(token_addr).cloned().unwrap_or(18);
                 total_chain_obj.insert(
                     token_addr.clone(),
-                    json!(u256_to_decimal_string(sum, dec, false)),
+                    json!(u256_to_decimal_string(sum, dec, false))
                 );
             }
+        }
+
+        // per-network timing + counters
+        EVM_NET_OK.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            network=%net,
+            elapsed_ms=net_start.elapsed().as_millis(),
+            evm_ok=EVM_NET_OK.load(Ordering::Relaxed),
+            evm_fail=EVM_NET_FAIL.load(Ordering::Relaxed),
+            "evm network processed"
+        );
+
+        // Optional slow-down for observing logs/state
+        if state.cfg.worker_slow_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(state.cfg.worker_slow_ms)).await;
         }
     }
 
     // ==========================
-    // SOL processing (Phase 6)
+    // SOL processing (native + SPL mints)
     // ==========================
     if !req.solana_wallet_addresses.is_empty() {
-        let sol_rpc = SolanaRpcClient::new(state.cfg.solana_rpc_url.clone());
+        let sol_start = Instant::now();
+        let sol_rpc = SolanaRpcClient::new(
+            state.cfg.solana_rpc_url.clone(),
+            state.cfg.rpc_timeout_ms
+        );
+
+        let sol_mints = sol_mints_from_request(&req);
 
         let mut sol_total_lamports: u128 = 0;
+        let mut spl_totals: std::collections::HashMap<
+            String,
+            u128
+        > = std::collections::HashMap::new();
+        let mut spl_decimals: std::collections::HashMap<
+            String,
+            u32
+        > = std::collections::HashMap::new();
 
         for w in &req.solana_wallet_addresses {
             let row_idx = *sol_wallet_index
@@ -330,11 +445,12 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                 .ok_or_else(|| anyhow!("sol wallet index missing"))?;
 
             let lamports = sol_rpc.get_balance_lamports(w).await.unwrap_or_else(|e| {
+                SOL_NET_FAIL.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(wallet=%w, error=%e, "sol getBalance failed -> keeping zero");
                 0u64
             });
 
-            sol_total_lamports += lamports as u128;
+            sol_total_lamports = sol_total_lamports.saturating_add(lamports as u128);
 
             {
                 let data_arr = final_result
@@ -342,9 +458,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                     .and_then(|v| v.as_array_mut())
                     .ok_or_else(|| anyhow!("final_result.data missing or not array"))?;
 
-                let row = data_arr
-                    .get_mut(row_idx)
-                    .ok_or_else(|| anyhow!("wallet row missing"))?;
+                let row = data_arr.get_mut(row_idx).ok_or_else(|| anyhow!("wallet row missing"))?;
 
                 let bal_obj = row
                     .get_mut("balance")
@@ -356,11 +470,49 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                     .and_then(|v| v.as_object_mut())
                     .ok_or_else(|| anyhow!("balance.sol missing or not object"))?;
 
-                sol_obj.insert("sol".to_string(), json!(lamports_to_sol_fixed_18(lamports)));
+                sol_obj.insert(
+                    "sol".to_string(),
+                    json!(lamports_u128_to_sol_fixed_18(lamports as u128))
+                );
+            }
+
+            // SPL mints provided by request contracts (networkName="sol")
+            for mint in &sol_mints {
+                let (amt_u128, dec_u32) = sol_rpc
+                    .get_spl_balance_by_owner_mint(w, mint).await
+                    .unwrap_or_else(|e| {
+                        SOL_NET_FAIL.fetch_add(1, Ordering::Relaxed);
+                        tracing::error!(wallet=%w, mint=%mint, error=%e, "sol spl fetch failed -> keeping zero");
+                        (0u128, 0u32)
+                    });
+
+                // decimals=0 could mean "no account exists"; we still store 0 with fixed 18.
+                // If RPC returned 0 decimals for real token, it’s rare; but fail-soft is fine.
+                spl_decimals.entry(mint.clone()).or_insert(dec_u32);
+                *spl_totals.entry(mint.clone()).or_insert(0u128) += amt_u128;
+
+                let formatted = u128_base_units_to_fixed_18(amt_u128, dec_u32);
+
+                // write into row.balance.sol.<mint>
+                let data_arr = final_result
+                    .get_mut("data")
+                    .and_then(|v| v.as_array_mut())
+                    .ok_or_else(|| anyhow!("final_result.data missing or not array"))?;
+                let row = data_arr.get_mut(row_idx).ok_or_else(|| anyhow!("wallet row missing"))?;
+                let bal_obj = row
+                    .get_mut("balance")
+                    .and_then(|v| v.as_object_mut())
+                    .ok_or_else(|| anyhow!("balance field not an object"))?;
+                let sol_obj = bal_obj
+                    .get_mut("sol")
+                    .and_then(|v| v.as_object_mut())
+                    .ok_or_else(|| anyhow!("balance.sol missing or not object"))?;
+
+                sol_obj.insert(mint.clone(), json!(formatted));
             }
         }
 
-        // total.balance.sol.sol
+        // total.balance.sol.*
         {
             let totals_balance_obj = final_result
                 .get_mut("total")
@@ -369,62 +521,71 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                 .and_then(|v| v.as_object_mut())
                 .ok_or_else(|| anyhow!("final_result.total.balance missing or not object"))?;
 
-            if let Some(sol_total_obj) = totals_balance_obj
-                .get_mut("sol")
-                .and_then(|v| v.as_object_mut())
+            if
+                let Some(sol_total_obj) = totals_balance_obj
+                    .get_mut("sol")
+                    .and_then(|v| v.as_object_mut())
             {
-                // sol_total_lamports fits in u64 realistically, but we store u128 here
-                let lamports_u64 = sol_total_lamports.min(u64::MAX as u128) as u64;
                 sol_total_obj.insert(
                     "sol".to_string(),
-                    json!(lamports_to_sol_fixed_18(lamports_u64)),
+                    json!(lamports_u128_to_sol_fixed_18(sol_total_lamports))
                 );
+
+                for mint in &sol_mints {
+                    let sum = spl_totals.get(mint).cloned().unwrap_or(0u128);
+                    let dec = spl_decimals.get(mint).cloned().unwrap_or(0u32);
+                    sol_total_obj.insert(
+                        mint.clone(),
+                        json!(u128_base_units_to_fixed_18(sum, dec))
+                    );
+                }
             }
         }
+
+        SOL_NET_OK.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            elapsed_ms = sol_start.elapsed().as_millis(),
+            sol_ok = SOL_NET_OK.load(Ordering::Relaxed),
+            sol_fail = SOL_NET_FAIL.load(Ordering::Relaxed),
+            mints = sol_mints.len(),
+            wallets = req.solana_wallet_addresses.len(),
+            "sol network processed"
+        );
     }
 
     // Update snapshot (final_result is fully-shaped)
-    snapshots
-        .update_one(
-            doc! { "requestKey": request_key },
-            doc! {
+    snapshots.update_one(
+        doc! { "requestKey": request_key },
+        doc! {
                 "$set": {
                     "lastUpdatedAt": now,
                     "refreshState": "idle",
                     "result": bson::to_bson(&final_result).unwrap_or(bson::Bson::Null)
                 }
-            },
-        )
-        .await?;
+            }
+    ).await?;
 
     // Mark job done
-    let jobs = state
-        .mongo
-        .db
-        .collection::<bson::Document>("balance_refresh_jobs");
+    let jobs = state.mongo.db.collection::<bson::Document>("balance_refresh_jobs");
 
     jobs.update_one(
         doc! { "requestKey": request_key },
-        doc! { "$set": { "status": "done", "updatedAt": now } },
-    )
-    .await?;
+        doc! { "$set": { "status": "done", "updatedAt": now } }
+    ).await?;
 
     Ok(())
 }
 
 async fn mark_job_failed(state: &AppState, request_key: &str) -> Result<(), mongodb::error::Error> {
-    let jobs = state
-        .mongo
-        .db
-        .collection::<bson::Document>("balance_refresh_jobs");
+    let jobs = state.mongo.db.collection::<bson::Document>("balance_refresh_jobs");
     let now = DateTime::now();
 
     let job = jobs.find_one(doc! { "requestKey": request_key }).await?;
-    let attempts = job
-        .as_ref()
-        .and_then(|d| d.get_i32("attempts").ok())
-        .unwrap_or(0)
-        + 1;
+    let attempts =
+        job
+            .as_ref()
+            .and_then(|d| d.get_i32("attempts").ok())
+            .unwrap_or(0) + 1;
 
     let backoff_secs = (attempts as i64) * 5;
     let next_retry_ms = now.timestamp_millis() + backoff_secs * 1000;
@@ -440,9 +601,8 @@ async fn mark_job_failed(state: &AppState, request_key: &str) -> Result<(), mong
             },
             "$setOnInsert": { "createdAt": now },
             "$inc": { "attempts": 1 }
-        },
-    )
-    .await?;
+        }
+    ).await?;
 
     Ok(())
 }

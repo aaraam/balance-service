@@ -1,6 +1,7 @@
 use anyhow::anyhow;
 use reqwest::Client;
 use serde_json::json;
+use std::time::Duration;
 
 #[derive(Clone)]
 pub struct RpcClient {
@@ -9,16 +10,19 @@ pub struct RpcClient {
 }
 
 impl RpcClient {
-    pub fn new(rpc_url: String) -> Self {
-        Self {
-            http: Client::new(),
-            rpc_url,
-        }
+    pub fn new(rpc_url: String, timeout_ms: u64) -> Self {
+        let http = Client::builder()
+            .timeout(Duration::from_millis(timeout_ms))
+            .build()
+            .expect("failed to build reqwest client");
+
+        Self { http, rpc_url }
     }
 
     pub async fn eth_call(&self, to: &str, data: &str) -> Result<String, anyhow::Error> {
         // thirdweb expects standard json-rpc
-        let payload = json!({
+        let payload =
+            json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "eth_call",

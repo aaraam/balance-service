@@ -2,7 +2,7 @@
 // balance-service\src\http\dto.rs
 // ==================================================
 
-use serde::{Deserialize, Serialize};
+use serde::{ Deserialize, Serialize };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -24,7 +24,7 @@ pub struct BalanceRequest {
     #[serde(default)]
     pub wallet_addresses: Vec<String>,
 
-    /// Solana wallets (now supported for native SOL only)
+    /// Solana wallets
     #[serde(default)]
     pub solana_wallet_addresses: Vec<String>,
 
@@ -50,16 +50,27 @@ fn native_symbol_for(network: &str) -> &str {
         "bnb" => "bnb",
         "matic" => "matic",
         "op" => "op",
+        "sol" => "sol",
         _ => network, // avax/ftm/cro/etc
     }
 }
 
+fn sol_mints_from_request(req: &BalanceRequest) -> Vec<String> {
+    req.contracts
+        .iter()
+        .find(|c| c.network_name == "sol")
+        .map(|c| c.contract_addresses.clone())
+        .unwrap_or_default()
+}
+
 /// Build a fully-shaped "zero balances" response:
 /// - EVM: native + token contracts per requested network
-/// - SOL: native SOL only (no SPL tokens yet)
+/// - SOL: native SOL + optional SPL token mints under contracts.networkName="sol"
 pub fn zero_result_from_request(req: &BalanceRequest) -> serde_json::Value {
     use serde_json::json;
     use serde_json::Map;
+
+    let sol_mints = sol_mints_from_request(req);
 
     let mut data: Vec<serde_json::Value> = Vec::new();
 
@@ -69,6 +80,9 @@ pub fn zero_result_from_request(req: &BalanceRequest) -> serde_json::Value {
 
         for cg in &req.contracts {
             let net = cg.network_name.as_str();
+            if net == "sol" {
+                continue;
+            }
 
             let mut chain_obj: Map<String, serde_json::Value> = Map::new();
             chain_obj.insert(native_symbol_for(net).to_string(), json!(ZERO_18));
@@ -80,24 +94,33 @@ pub fn zero_result_from_request(req: &BalanceRequest) -> serde_json::Value {
             balance_obj.insert(net.to_string(), json!(chain_obj));
         }
 
-        data.push(json!({
+        data.push(
+            json!({
             "walletAddress": w,
             "balance": balance_obj
-        }));
+        })
+        );
     }
 
-    // ---- SOL rows (native only) ----
+    // ---- SOL rows (native + optional SPL mints) ----
     for w in &req.solana_wallet_addresses {
         let mut balance_obj: Map<String, serde_json::Value> = Map::new();
 
         let mut sol_obj: Map<String, serde_json::Value> = Map::new();
         sol_obj.insert("sol".to_string(), json!(ZERO_18));
+
+        for mint in &sol_mints {
+            sol_obj.insert(mint.clone(), json!(ZERO_18));
+        }
+
         balance_obj.insert("sol".to_string(), json!(sol_obj));
 
-        data.push(json!({
+        data.push(
+            json!({
             "walletAddress": w,
             "balance": balance_obj
-        }));
+        })
+        );
     }
 
     // ---- Totals ----
@@ -106,6 +129,9 @@ pub fn zero_result_from_request(req: &BalanceRequest) -> serde_json::Value {
     // EVM totals per contract group
     for cg in &req.contracts {
         let net = cg.network_name.as_str();
+        if net == "sol" {
+            continue;
+        }
 
         let mut total_chain_obj: Map<String, serde_json::Value> = Map::new();
         total_chain_obj.insert(native_symbol_for(net).to_string(), json!(ZERO_18));
@@ -116,10 +142,13 @@ pub fn zero_result_from_request(req: &BalanceRequest) -> serde_json::Value {
         totals.insert(net.to_string(), json!(total_chain_obj));
     }
 
-    // SOL totals (native only)
+    // SOL totals (native + optional SPL mints)
     if !req.solana_wallet_addresses.is_empty() {
         let mut sol_total_obj: Map<String, serde_json::Value> = Map::new();
         sol_total_obj.insert("sol".to_string(), json!(ZERO_18));
+        for mint in &sol_mints {
+            sol_total_obj.insert(mint.clone(), json!(ZERO_18));
+        }
         totals.insert("sol".to_string(), json!(sol_total_obj));
     }
 

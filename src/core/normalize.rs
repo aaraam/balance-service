@@ -3,7 +3,7 @@
 // ==================================================
 
 use crate::chains::is_ignored_network;
-use crate::http::dto::{BalanceRequest, ContractGroup};
+use crate::http::dto::{ BalanceRequest, ContractGroup };
 
 fn lc(s: &str) -> String {
     s.trim().to_lowercase()
@@ -11,31 +11,48 @@ fn lc(s: &str) -> String {
 
 pub fn normalize_request(req: &BalanceRequest) -> BalanceRequest {
     // Normalize EVM wallets
-    let mut evm_wallets: Vec<String> = req.wallet_addresses.iter().map(|w| lc(w)).collect();
+    let mut evm_wallets: Vec<String> = req.wallet_addresses
+        .iter()
+        .map(|w| lc(w))
+        .collect();
     evm_wallets.sort();
     evm_wallets.dedup();
 
-    // Normalize Solana wallets (base58 -> we just trim/lowercase? actually base58 is case-sensitive)
+    // Normalize Solana wallets (base58 is case-sensitive)
     // IMPORTANT: DO NOT lowercase Solana addresses. Only trim.
-    let mut sol_wallets: Vec<String> = req
-        .solana_wallet_addresses
+    let mut sol_wallets: Vec<String> = req.solana_wallet_addresses
         .iter()
         .map(|w| w.trim().to_string())
         .collect();
     sol_wallets.sort();
     sol_wallets.dedup();
 
-    // Normalize contracts per network, and DROP ignored networks entirely
-    let mut contracts: Vec<ContractGroup> = req
-        .contracts
+    // Normalize contracts per network, and DROP ignored networks entirely.
+    // IMPORTANT:
+    // - EVM contract addresses are safe to lowercase (hex)
+    // - Solana mint addresses are base58 and case-sensitive => DO NOT lowercase
+    let mut contracts: Vec<ContractGroup> = req.contracts
         .iter()
         .map(|c| {
-            let mut addrs: Vec<String> = c.contract_addresses.iter().map(|a| lc(a)).collect();
+            let net = lc(&c.network_name);
+
+            let mut addrs: Vec<String> = if net == "sol" {
+                c.contract_addresses
+                    .iter()
+                    .map(|a| a.trim().to_string())
+                    .collect()
+            } else {
+                c.contract_addresses
+                    .iter()
+                    .map(|a| lc(a))
+                    .collect()
+            };
+
             addrs.sort();
             addrs.dedup();
 
             ContractGroup {
-                network_name: lc(&c.network_name),
+                network_name: net,
                 contract_addresses: addrs,
             }
         })
