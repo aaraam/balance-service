@@ -28,6 +28,7 @@ pub enum ChainKey {
 }
 
 impl ChainKey {
+    #[allow(dead_code)]
     pub fn from_network_name(s: &str) -> Option<Self> {
         match s {
             "eth" => Some(Self::Eth),
@@ -53,7 +54,6 @@ impl ChainKey {
             "mcardano" => Some(Self::Mcardano),
             "okxchain" => Some(Self::Okxchain),
             "callisto" => Some(Self::Callisto),
-
             _ => None,
         }
     }
@@ -89,6 +89,11 @@ impl ChainKey {
     pub fn thirdweb_rpc_url(&self, client_id: &str) -> String {
         format!("https://{}.rpc.thirdweb.com/{}", self.chain_id(), client_id)
     }
+}
+
+// Central source of truth: networks we IGNORE even if client sends them.
+pub fn is_ignored_network(network_name: &str) -> bool {
+    matches!(network_name, "trx" | "sol" | "btc" | "doge")
 }
 
 pub fn supported_evm_networks() -> HashMap<&'static str, ChainKey> {

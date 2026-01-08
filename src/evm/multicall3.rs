@@ -1,50 +1,45 @@
+// ==================================================
+// balance-service\src\evm\multicall3.rs
+// ==================================================
+
 use anyhow::anyhow;
-use ethabi::{ Function, Param, ParamType, StateMutability, Token };
-use ethereum_types::{ H160, U256 };
+use ethabi::{Function, Param, ParamType, StateMutability, Token};
+use ethereum_types::{H160, U256};
 use std::collections::HashMap;
 
 use super::rpc::RpcClient;
 
 pub const MULTICALL3_ADDR: &str = "0xcA11bde05977b3631167028862bE2a173976CA11";
 
+#[allow(deprecated)]
 fn fn_aggregate3() -> Function {
     // aggregate3((address,bool,bytes)[]) returns ( (bool,bytes)[] )
     Function {
         name: "aggregate3".to_string(),
         inputs: vec![Param {
             name: "calls".to_string(),
-            kind: ParamType::Array(
-                Box::new(
-                    ParamType::Tuple(
-                        vec![
-                            ParamType::Address, // target
-                            ParamType::Bool, // allowFailure
-                            ParamType::Bytes // callData
-                        ]
-                    )
-                )
-            ),
+            kind: ParamType::Array(Box::new(ParamType::Tuple(vec![
+                ParamType::Address, // target
+                ParamType::Bool,    // allowFailure
+                ParamType::Bytes,   // callData
+            ]))),
             internal_type: None,
         }],
         outputs: vec![Param {
             name: "returnData".to_string(),
-            kind: ParamType::Array(
-                Box::new(
-                    ParamType::Tuple(
-                        vec![
-                            ParamType::Bool, // success
-                            ParamType::Bytes // returnData
-                        ]
-                    )
-                )
-            ),
+            kind: ParamType::Array(Box::new(ParamType::Tuple(vec![
+                ParamType::Bool,  // success
+                ParamType::Bytes, // returnData
+            ]))),
             internal_type: None,
         }],
+        // ✅ Route A: keep field to satisfy ethabi struct init, but don’t use it
         constant: None,
         state_mutability: StateMutability::Payable,
     }
 }
 
+#[allow(deprecated)]
 fn fn_decimals() -> Function {
     Function {
         name: "decimals".to_string(),
@@ -54,6 +49,7 @@ fn fn_decimals() -> Function {
             kind: ParamType::Uint(8),
             internal_type: None,
         }],
+        // ✅ Route A
         constant: None,
         state_mutability: StateMutability::View,
     }
@@ -67,6 +63,7 @@ fn u8_from_return_data(bytes: &[u8]) -> Option<u8> {
     Some(*bytes.last()?)
 }
 
+#[allow(deprecated)]
 fn fn_get_eth_balance() -> Function {
     Function {
         name: "getEthBalance".to_string(),
@@ -80,11 +77,13 @@ fn fn_get_eth_balance() -> Function {
             kind: ParamType::Uint(256),
             internal_type: None,
         }],
+        // ✅ Route A
         constant: None,
         state_mutability: StateMutability::View,
     }
 }
 
+#[allow(deprecated)]
 fn fn_balance_of() -> Function {
     Function {
         name: "balanceOf".to_string(),
@@ -98,7 +97,8 @@ fn fn_balance_of() -> Function {
             kind: ParamType::Uint(256),
             internal_type: None,
         }],
-        constant: Some(true),
+        // ✅ Route A: keep it, don’t care about it
+        constant: None,
         state_mutability: StateMutability::View,
     }
 }
@@ -125,14 +125,14 @@ fn u256_from_return_data(bytes: &[u8]) -> U256 {
 }
 
 pub struct EvmBalances {
-    pub native: HashMap<String, U256>, // wallet -> native
+    pub native: HashMap<String, U256>,                // wallet -> native
     pub erc20: HashMap<String, HashMap<String, U256>>, // wallet -> token -> bal
 }
 
 pub async fn fetch_token_decimals_multicall3(
     rpc: &RpcClient,
     token_contracts: &[String],
-    max_calls_per_batch: usize
+    max_calls_per_batch: usize,
 ) -> Result<HashMap<String, u32>, anyhow::Error> {
     let agg = fn_aggregate3();
     let decimals_fn = fn_decimals();
@@ -146,9 +146,11 @@ pub async fn fetch_token_decimals_multicall3(
         let calldata = decimals_fn.encode_input(&[])?;
 
         metas.push(t.clone());
-        call_tokens.push(
-            Token::Tuple(vec![Token::Address(t_addr), Token::Bool(true), Token::Bytes(calldata)])
-        );
+        call_tokens.push(Token::Tuple(vec![
+            Token::Address(t_addr),
+            Token::Bool(true),
+            Token::Bytes(calldata),
+        ]));
     }
 
     let mut out: HashMap<String, u32> = HashMap::new();
@@ -169,9 +171,7 @@ pub async fn fetch_token_decimals_multicall3(
         let decoded = agg.decode_output(&bytes)?;
         let results = match decoded.get(0) {
             Some(Token::Array(arr)) => arr,
-            _ => {
-                return Err(anyhow!("unexpected aggregate3 decode shape for decimals"));
-            }
+            _ => return Err(anyhow!("unexpected aggregate3 decode shape for decimals")),
         };
 
         for (idx, item) in results.iter().enumerate() {
@@ -209,7 +209,7 @@ pub async fn fetch_balances_multicall3(
     rpc: &RpcClient,
     wallets: &[String],
     token_contracts: &[String],
-    max_calls_per_batch: usize
+    max_calls_per_batch: usize,
 ) -> Result<EvmBalances, anyhow::Error> {
     let agg = fn_aggregate3();
     let get_eth = fn_get_eth_balance();
@@ -239,15 +239,11 @@ pub async fn fetch_balances_multicall3(
             token: None,
         });
 
-        call_tokens.push(
-            Token::Tuple(
-                vec![
-                    Token::Address(parse_h160(MULTICALL3_ADDR)?), // target = Multicall3 itself
-                    Token::Bool(true), // allowFailure
-                    Token::Bytes(calldata)
-                ]
-            )
-        );
+        call_tokens.push(Token::Tuple(vec![
+            Token::Address(parse_h160(MULTICALL3_ADDR)?), // target = Multicall3 itself
+            Token::Bool(true),                            // allowFailure
+            Token::Bytes(calldata),
+        ]));
     }
 
     // erc20 calls
@@ -263,15 +259,11 @@ pub async fn fetch_balances_multicall3(
                 token: Some(t.clone()),
             });
 
-            call_tokens.push(
-                Token::Tuple(
-                    vec![
-                        Token::Address(t_addr), // target = token contract
-                        Token::Bool(true), // allowFailure
-                        Token::Bytes(calldata) // callData
-                    ]
-                )
-            );
+            call_tokens.push(Token::Tuple(vec![
+                Token::Address(t_addr), // target = token contract
+                Token::Bool(true),      // allowFailure
+                Token::Bytes(calldata), // callData
+            ]));
         }
     }
 
@@ -296,9 +288,7 @@ pub async fn fetch_balances_multicall3(
         // decoded[0] = Array(Tuple(success, bytes))
         let results = match decoded.get(0) {
             Some(Token::Array(arr)) => arr,
-            _ => {
-                return Err(anyhow!("unexpected aggregate3 decode shape"));
-            }
+            _ => return Err(anyhow!("unexpected aggregate3 decode shape")),
         };
 
         for (idx, item) in results.iter().enumerate() {
