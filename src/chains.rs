@@ -6,8 +6,6 @@ pub enum ChainKey {
     Bnb,
     Matic,
     Op,
-
-    // thirdweb service (inactive now but supported)
     Gnosis,
     Rstk,
     Ethc,
@@ -36,7 +34,6 @@ impl ChainKey {
             "bnb" => Some(Self::Bnb),
             "matic" => Some(Self::Matic),
             "op" => Some(Self::Op),
-
             "gnosis" => Some(Self::Gnosis),
             "rstk" => Some(Self::Rstk),
             "ethc" => Some(Self::Ethc),
@@ -67,7 +64,6 @@ impl ChainKey {
             Self::Bnb => 56,
             Self::Matic => 137,
             Self::Op => 10,
-
             Self::Gnosis => 100,
             Self::Rstk => 30,
             Self::Ethc => 61,
@@ -101,7 +97,6 @@ pub fn supported_evm_networks() -> HashMap<&'static str, ChainKey> {
         ("bnb", ChainKey::Bnb),
         ("matic", ChainKey::Matic),
         ("op", ChainKey::Op),
-
         ("gnosis", ChainKey::Gnosis),
         ("rstk", ChainKey::Rstk),
         ("ethc", ChainKey::Ethc),
@@ -122,9 +117,4 @@ pub fn supported_evm_networks() -> HashMap<&'static str, ChainKey> {
         ("okxchain", ChainKey::Okxchain),
         ("callisto", ChainKey::Callisto),
     ])
-}
-
-/// Non-EVM chains we currently "support" only as zero-balance stubs.
-pub fn is_non_evm_stub(network_name: &str) -> bool {
-    matches!(network_name, "trx" | "sol" | "btc" | "doge")
 }

@@ -1,7 +1,16 @@
+// ==================================================
+// balance-service\src\core\normalize.rs
+// ==================================================
+
 use crate::http::dto::{BalanceRequest, ContractGroup};
 
 fn lc(s: &str) -> String {
     s.trim().to_lowercase()
+}
+
+// Networks we explicitly IGNORE even if client sends them.
+fn is_ignored_network(net: &str) -> bool {
+    matches!(net, "trx" | "sol" | "btc" | "doge")
 }
 
 pub fn normalize_request(req: &BalanceRequest) -> BalanceRequest {
@@ -10,7 +19,7 @@ pub fn normalize_request(req: &BalanceRequest) -> BalanceRequest {
     evm_wallets.sort();
     evm_wallets.dedup();
 
-    // Normalize contracts per network
+    // Normalize contracts per network, and DROP ignored networks entirely
     let mut contracts: Vec<ContractGroup> = req
         .contracts
         .iter()
@@ -24,29 +33,18 @@ pub fn normalize_request(req: &BalanceRequest) -> BalanceRequest {
                 contract_addresses: addrs,
             }
         })
+        .filter(|c| !is_ignored_network(c.network_name.as_str()))
         .collect();
 
     contracts.sort_by(|a, b| a.network_name.cmp(&b.network_name));
 
-    // Non-EVM lists: keep as-is for now (no lowercasing base58/bech32)
-    let mut sol = req.solana_wallet_addresses.clone();
-    sol.sort();
-    sol.dedup();
-
-    let mut doge = req.doge_wallet_addresses.clone();
-    doge.sort();
-    doge.dedup();
-
-    let mut btc = req.btc_wallet_addresses.clone();
-    btc.sort();
-    btc.dedup();
-
+    // Non-EVM lists: explicitly ignored -> always empty
     BalanceRequest {
         hard_refresh: req.hard_refresh,
         contracts,
         wallet_addresses: evm_wallets,
-        solana_wallet_addresses: sol,
-        doge_wallet_addresses: doge,
-        btc_wallet_addresses: btc,
+        solana_wallet_addresses: vec![],
+        doge_wallet_addresses: vec![],
+        btc_wallet_addresses: vec![],
     }
 }

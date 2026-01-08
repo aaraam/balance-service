@@ -1,5 +1,5 @@
 // ==================================================
-// FILE: src/worker/runner.rs
+// balance-service\src\worker\runner.rs
 // ==================================================
 
 use crate::AppState;
@@ -7,7 +7,7 @@ use bson::{doc, DateTime};
 use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
 use serde_json::json;
 
-use crate::chains::{is_non_evm_stub, supported_evm_networks};
+use crate::chains::supported_evm_networks;
 use crate::evm::format::u256_to_decimal_string;
 use crate::evm::multicall3::{
     fetch_balances_multicall3, fetch_token_decimals_multicall3, EvmBalances,
@@ -25,6 +25,11 @@ fn native_symbol_for(network: &str) -> &str {
         "op" => "op",
         _ => network, // avax/ftm/cro/etc
     }
+}
+
+// Explicit ignore list (even if it sneaks into contracts)
+fn is_ignored_network(net: &str) -> bool {
+    matches!(net, "trx" | "sol" | "btc" | "doge")
 }
 
 pub async fn run_worker(state: AppState) {
@@ -140,7 +145,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
     let mut data_arr: Vec<serde_json::Value> = vec![];
     let mut totals: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
 
-    // Pre-init wallet rows (EVM only for now)
+    // Pre-init wallet rows (EVM only)
     for w in &req.wallet_addresses {
         data_arr.push(json!({
             "walletAddress": w,
@@ -159,6 +164,12 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
 
     for cg in &req.contracts {
         let net = cg.network_name.as_str();
+
+        // Ignore non-EVM networks even if they appear in contracts
+        if is_ignored_network(net) {
+            tracing::warn!(network=%net, "ignored network in contracts list");
+            continue;
+        }
 
         if let Some(chain) = evm_map.get(net).copied() {
             let rpc_url = chain.thirdweb_rpc_url(&state.cfg.thirdweb_client_id);
@@ -196,17 +207,14 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             for w in &req.wallet_addresses {
                 let native_wei = balances.native.get(w).cloned().unwrap_or_default();
 
-                // native: 18 decimals, trimmed
+                // native: 18 decimals, trimmed (unchanged here)
                 let native_str = u256_to_decimal_string(native_wei, 18, true);
 
                 let token_map = balances.erc20.get(w).cloned().unwrap_or_default();
 
                 // chain object holds: { nativeSymbol: "...", tokenAddr: "..." }
                 let mut chain_obj = serde_json::Map::new();
-                chain_obj.insert(
-                    native_symbol_for(net).to_string(),
-                    json!(native_str),
-                );
+                chain_obj.insert(native_symbol_for(net).to_string(), json!(native_str));
 
                 for (token_addr, raw_bal) in token_map {
                     let dec = decimals_map.get(&token_addr).cloned().unwrap_or(18);
@@ -258,26 +266,14 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             }
 
             totals.insert(net.to_string(), json!(total_chain_obj));
-        } else if is_non_evm_stub(net) {
-            // keep as stub until you implement TRX/SOL/BTC/DOGE fetchers in THIS service
-            totals.insert(
-                net.to_string(),
-                json!({
-                    "stub": true
-                }),
-            );
         } else {
-            totals.insert(
-                net.to_string(),
-                json!({
-                    "stub": true,
-                    "reason": "unsupported_network"
-                }),
-            );
+            // Unknown/unsupported network: ignore silently (or log + continue)
+            tracing::warn!(network=%net, "unsupported network in contracts list (ignored)");
+            continue;
         }
     }
 
-    // Final result: matches your sample shape (no marker)
+    // Final result
     let final_result = json!({
         "data": data_arr,
         "total": {

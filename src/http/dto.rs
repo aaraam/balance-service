@@ -1,3 +1,7 @@
+// ==================================================
+// balance-service\src\http\dto.rs
+// ==================================================
+
 use serde::{ Deserialize, Serialize };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,7 +24,7 @@ pub struct BalanceRequest {
     #[serde(default)]
     pub wallet_addresses: Vec<String>,
 
-    /// Non-EVM wallets (currently stubbed to 0)
+    /// Non-EVM wallets (IGNORED by this service; kept for backward compatibility)
     #[serde(default)]
     pub solana_wallet_addresses: Vec<String>,
     #[serde(default)]
@@ -48,15 +52,15 @@ fn native_symbol_for(network: &str) -> &str {
     }
 }
 
-/// NEW: Build a fully-shaped "zero balances" response that matches your standard.
+/// Build a fully-shaped "zero balances" response for EVM ONLY.
+/// Note: Non-EVM (sol/btc/doge/trx) is intentionally ignored even if present in request.
 pub fn zero_result_from_request(req: &BalanceRequest) -> serde_json::Value {
     use serde_json::json;
     use serde_json::Map;
 
-    // ---- Build data rows for all wallets (EVM + non-EVM lists) ----
+    // ---- Build data rows for EVM wallets only ----
     let mut data: Vec<serde_json::Value> = Vec::new();
 
-    // EVM wallets: include per-network objects for every requested contract group
     for w in &req.wallet_addresses {
         let mut balance_obj: Map<String, serde_json::Value> = Map::new();
 
@@ -82,36 +86,7 @@ pub fn zero_result_from_request(req: &BalanceRequest) -> serde_json::Value {
         );
     }
 
-    // Non-EVM wallets: minimal per-network object with a native symbol-like key
-    // (until you actually integrate SOL/TRX/BTC/DOGE fetchers)
-    for w in &req.solana_wallet_addresses {
-        data.push(
-            json!({
-            "walletAddress": w,
-            "balance": { "sol": { "sol": ZERO_18 } }
-        })
-        );
-    }
-
-    for w in &req.btc_wallet_addresses {
-        data.push(
-            json!({
-            "walletAddress": w,
-            "balance": { "btc": { "btc": ZERO_18 } }
-        })
-        );
-    }
-
-    for w in &req.doge_wallet_addresses {
-        data.push(
-            json!({
-            "walletAddress": w,
-            "balance": { "doge": { "doge": ZERO_18 } }
-        })
-        );
-    }
-
-    // ---- Build totals ----
+    // ---- Build totals for EVM contract groups only ----
     let mut totals: Map<String, serde_json::Value> = Map::new();
 
     for cg in &req.contracts {
@@ -124,17 +99,6 @@ pub fn zero_result_from_request(req: &BalanceRequest) -> serde_json::Value {
         }
 
         totals.insert(net.to_string(), json!(total_chain_obj));
-    }
-
-    // also include non-evm totals if those wallet lists exist
-    if !req.solana_wallet_addresses.is_empty() {
-        totals.insert("sol".to_string(), json!({ "sol": ZERO_18 }));
-    }
-    if !req.btc_wallet_addresses.is_empty() {
-        totals.insert("btc".to_string(), json!({ "btc": ZERO_18 }));
-    }
-    if !req.doge_wallet_addresses.is_empty() {
-        totals.insert("doge".to_string(), json!({ "doge": ZERO_18 }));
     }
 
     json!({
