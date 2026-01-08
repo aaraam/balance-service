@@ -42,7 +42,7 @@ impl AppConfig {
         // optional env vars
         let worker_enabled = std::env::var("WORKER_ENABLED")
             .ok()
-            .map(|v| (v == "1" || v.eq_ignore_ascii_case("true")))
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(true);
 
         let worker_poll_ms = std::env::var("WORKER_POLL_MS")
