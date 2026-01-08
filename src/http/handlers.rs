@@ -1,10 +1,10 @@
 use crate::core::key::request_key_from_canonical_json;
 use crate::core::normalize::normalize_request;
-use crate::db::{refresh_jobs, snapshots};
-use crate::http::dto::{empty_legacy_result, BalanceRequest, BalanceResponse};
+use crate::db::{ refresh_jobs, snapshots };
+use crate::http::dto::{ zero_result_from_request, BalanceRequest, BalanceResponse };
 use crate::AppState;
 
-use axum::{extract::State, Json};
+use axum::{ extract::State, Json };
 use bson::DateTime;
 use serde_json::json;
 
@@ -16,7 +16,7 @@ pub async fn health() -> &'static str {
 
 pub async fn get_multi_wallet_balances(
     State(state): State<AppState>,
-    Json(req): Json<BalanceRequest>,
+    Json(req): Json<BalanceRequest>
 ) -> Json<BalanceResponse> {
     let normalized = normalize_request(&req);
     let canonical = serde_json::to_string(&normalized).unwrap_or_else(|_| "{}".to_string());
@@ -40,8 +40,7 @@ pub async fn get_multi_wallet_balances(
 
     match snapshots::get_snapshot(&state.mongo.db, &request_key).await {
         Ok(Some(doc)) => {
-            let age_secs =
-                (now.timestamp_millis() - doc.last_updated_at.timestamp_millis()) / 1000;
+            let age_secs = (now.timestamp_millis() - doc.last_updated_at.timestamp_millis()) / 1000;
             let is_stale = age_secs > STALE_AFTER_SECS;
 
             tracing::debug!(
@@ -52,7 +51,6 @@ pub async fn get_multi_wallet_balances(
                 "snapshot hit"
             );
 
-            // Phase 2+ behavior: if hard_refresh true, enqueue regardless of staleness
             if is_stale || normalized.hard_refresh {
                 match refresh_jobs::enqueue_or_requeue(&state.mongo.db, &request_key).await {
                     Ok(did_queue) => {
@@ -66,13 +64,8 @@ pub async fn get_multi_wallet_balances(
                             let _ = snapshots::set_refresh_state(
                                 &state.mongo.db,
                                 &request_key,
-                                "queued",
-                            )
-                            .await;
-                            tracing::debug!(
-                                request_key=%request_key,
-                                "snapshot refreshState set to queued"
-                            );
+                                "queued"
+                            ).await;
                         }
                     }
                     Err(e) => {
@@ -94,27 +87,25 @@ pub async fn get_multi_wallet_balances(
         Ok(None) => {
             tracing::info!(
                 request_key=%request_key,
-                "snapshot miss → creating empty snapshot + enqueue job"
+                "snapshot miss → creating zero snapshot + enqueue job"
             );
 
             let normalized_json = serde_json::to_value(&normalized).unwrap_or(json!({}));
-            let empty_result = empty_legacy_result();
+            let zero_result = zero_result_from_request(&normalized);
 
-            if let Err(e) = snapshots::upsert_empty_snapshot(
-                &state.mongo.db,
-                &request_key,
-                normalized_json,
-                empty_result.clone(),
-            )
-            .await
+            if
+                let Err(e) = snapshots::upsert_empty_snapshot(
+                    &state.mongo.db,
+                    &request_key,
+                    normalized_json,
+                    zero_result.clone()
+                ).await
             {
                 tracing::error!(
                     request_key=%request_key,
                     error=%e,
-                    "failed to upsert empty snapshot"
+                    "failed to upsert zero snapshot"
                 );
-            } else {
-                tracing::debug!(request_key=%request_key, "empty snapshot upserted");
             }
 
             match refresh_jobs::enqueue_or_requeue(&state.mongo.db, &request_key).await {
@@ -126,16 +117,15 @@ pub async fn get_multi_wallet_balances(
                     );
 
                     if did_queue {
-                        let _ =
-                            snapshots::set_refresh_state(&state.mongo.db, &request_key, "queued")
-                                .await;
-                        tracing::debug!(
-                            request_key=%request_key,
-                            "snapshot refreshState set to queued"
-                        );
+                        let _ = snapshots::set_refresh_state(
+                            &state.mongo.db,
+                            &request_key,
+                            "queued"
+                        ).await;
                     }
                 }
-                Err(e) => tracing::error!(
+                Err(e) =>
+                    tracing::error!(
                     request_key=%request_key,
                     error=%e,
                     "failed to enqueue refresh job"
@@ -144,7 +134,7 @@ pub async fn get_multi_wallet_balances(
 
             Json(BalanceResponse {
                 status: true,
-                result: empty_result,
+                result: zero_result,
             })
         }
 
@@ -154,9 +144,13 @@ pub async fn get_multi_wallet_balances(
                 error=%e,
                 "snapshot fetch error (fail-soft)"
             );
+
+            // IMPORTANT: still return standard-shaped zeros
+            let zero_result = zero_result_from_request(&normalized);
+
             Json(BalanceResponse {
                 status: true,
-                result: empty_legacy_result(),
+                result: zero_result,
             })
         }
     }
