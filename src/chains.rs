@@ -6,6 +6,8 @@ pub enum ChainKey {
     Bnb,
     Matic,
     Op,
+
+    // thirdweb service (inactive now but supported)
     Gnosis,
     Rstk,
     Ethc,
@@ -123,7 +125,6 @@ pub fn supported_evm_networks() -> HashMap<&'static str, ChainKey> {
 }
 
 /// Non-EVM chains we currently "support" only as zero-balance stubs.
-/// NOTE: Solana is no longer a stub — it has its own worker pipeline.
 pub fn is_non_evm_stub(network_name: &str) -> bool {
-    matches!(network_name, "trx" | "btc" | "doge")
+    matches!(network_name, "trx" | "sol" | "btc" | "doge")
 }
