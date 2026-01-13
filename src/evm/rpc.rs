@@ -21,8 +21,7 @@ impl RpcClient {
 
     pub async fn eth_call(&self, to: &str, data: &str) -> Result<String, anyhow::Error> {
         // thirdweb expects standard json-rpc
-        let payload =
-            json!({
+        let payload = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "eth_call",

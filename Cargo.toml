@@ -29,3 +29,5 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 ethabi = "18"
 ethereum-types = "0.14"
 
+bs58 = "0.5"
+

@@ -4,6 +4,8 @@
 
 use serde::{ Deserialize, Serialize };
 
+use crate::http::error::ApiErrorBody;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContractGroup {
@@ -38,7 +40,11 @@ pub struct BalanceRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BalanceResponse {
     pub status: bool,
+
     pub result: serde_json::Value,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ApiErrorBody>,
 }
 
 // Client asked for fixed 18-decimal zeros

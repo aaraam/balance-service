@@ -20,8 +20,7 @@ impl SolanaRpcClient {
     }
 
     pub async fn get_balance_lamports(&self, pubkey: &str) -> Result<u64, anyhow::Error> {
-        let payload =
-            json!({
+        let payload = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "getBalance",
@@ -55,10 +54,9 @@ impl SolanaRpcClient {
     pub async fn get_spl_balance_by_owner_mint(
         &self,
         owner_pubkey: &str,
-        mint_pubkey: &str
+        mint_pubkey: &str,
     ) -> Result<(u128, u32), anyhow::Error> {
-        let payload =
-            json!({
+        let payload = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "getTokenAccountsByOwner",
@@ -74,13 +72,11 @@ impl SolanaRpcClient {
         let v: serde_json::Value = res.json().await?;
 
         if !status.is_success() {
-            return Err(
-                anyhow!(
-                    "sol rpc http error (getTokenAccountsByOwner): status={} body={}",
-                    status,
-                    v
-                )
-            );
+            return Err(anyhow!(
+                "sol rpc http error (getTokenAccountsByOwner): status={} body={}",
+                status,
+                v
+            ));
         }
         if let Some(err) = v.get("error") {
             return Err(anyhow!("sol rpc error (getTokenAccountsByOwner): {}", err));
@@ -114,7 +110,8 @@ impl SolanaRpcClient {
         let decimals = token_amount
             .get("decimals")
             .and_then(|x| x.as_u64())
-            .ok_or_else(|| anyhow!("missing tokenAmount.decimals: {}", v))? as u32;
+            .ok_or_else(|| anyhow!("missing tokenAmount.decimals: {}", v))?
+            as u32;
 
         let amount_u128: u128 = amount_str
             .parse::<u128>()

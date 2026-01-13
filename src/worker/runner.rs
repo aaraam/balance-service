@@ -9,6 +9,7 @@ use mongodb::options::{ FindOneAndUpdateOptions, ReturnDocument };
 use serde_json::json;
 
 use crate::chains::{ is_ignored_network, supported_evm_networks };
+use crate::core::normalize::normalize_request; // ✅ NEW: re-normalize inside worker (heal poisoned snapshots)
 use crate::evm::format::u256_to_decimal_string;
 use crate::evm::multicall3::{
     fetch_balances_multicall3,
@@ -40,6 +41,20 @@ static EVM_NET_FAIL: AtomicU64 = AtomicU64::new(0);
 
 static SOL_NET_OK: AtomicU64 = AtomicU64::new(0);
 static SOL_NET_FAIL: AtomicU64 = AtomicU64::new(0);
+
+fn is_valid_solana_pubkey_32(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let decoded = match bs58::decode(t).into_vec() {
+        Ok(v) => v,
+        Err(_) => {
+            return false;
+        }
+    };
+    decoded.len() == 32
+}
 
 fn native_symbol_for(network: &str) -> &str {
     match network {
@@ -213,7 +228,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         doc! { "$set": { "refreshState": "running" } }
     ).await?;
 
-    // Load normalized request
+    // Load normalized request (but DON'T trust it blindly)
     let snap = snapshots
         .find_one(doc! { "requestKey": request_key }).await?
         .ok_or_else(|| anyhow!("snapshot not found for requestKey"))?;
@@ -224,7 +239,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         ::from_bson(normalized_req_bson)
         .unwrap_or_else(|_| json!({}));
 
-    let req: BalanceRequest = serde_json
+    let req_raw: BalanceRequest = serde_json
         ::from_value(normalized_req_json.clone())
         .unwrap_or_else(|_| BalanceRequest {
             hard_refresh: false,
@@ -234,6 +249,14 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             doge_wallet_addresses: vec![],
             btc_wallet_addresses: vec![],
         });
+
+    // ✅ CRITICAL FIX:
+    // Re-normalize inside worker to avoid poisoned snapshots bricking jobs.
+    // This enforces Option-1 behavior: invalid wallets/contracts get DROPPED.
+    let req: BalanceRequest = normalize_request(&req_raw);
+
+    // Heal snapshot.normalizedRequest with sanitized version (so future jobs are clean)
+    let req_sanitized_json = serde_json::to_value(&req).unwrap_or_else(|_| json!({}));
 
     // Build fully-shaped ZERO result FIRST (contract truth)
     let mut final_result = zero_result_from_request(&req);
@@ -265,12 +288,12 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         }
 
         if is_ignored_network(net) {
-            tracing::warn!(network=%net, "ignored network in contracts list");
+            tracing::warn!(network = %net, "ignored network in contracts list");
             continue;
         }
 
         let Some(chain) = evm_map.get(net).copied() else {
-            tracing::warn!(network=%net, "unsupported network in contracts list (ignored)");
+            tracing::warn!(network = %net, "unsupported network in contracts list (ignored)");
             continue;
         };
 
@@ -291,11 +314,11 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             Err(e) => {
                 EVM_NET_FAIL.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(
-                    network=%net,
-                    error=%e,
-                    elapsed_ms=net_start.elapsed().as_millis(),
-                    evm_ok=EVM_NET_OK.load(Ordering::Relaxed),
-                    evm_fail=EVM_NET_FAIL.load(Ordering::Relaxed),
+                    network = %net,
+                    error = %e,
+                    elapsed_ms = net_start.elapsed().as_millis(),
+                    evm_ok = EVM_NET_OK.load(Ordering::Relaxed),
+                    evm_fail = EVM_NET_FAIL.load(Ordering::Relaxed),
                     "evm fetch failed -> keeping zeros"
                 );
                 EvmBalances {
@@ -310,7 +333,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         {
             Ok(m) => m,
             Err(e) => {
-                tracing::error!(network=%net, error=%e, "decimals fetch failed -> default 18");
+                tracing::error!(network = %net, error = %e, "decimals fetch failed -> default 18");
                 std::collections::HashMap::new()
             }
         };
@@ -320,40 +343,38 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                 .get(w)
                 .ok_or_else(|| anyhow!("evm wallet index missing"))?;
 
-            {
-                let data_arr = final_result
-                    .get_mut("data")
-                    .and_then(|v| v.as_array_mut())
-                    .ok_or_else(|| anyhow!("final_result.data missing or not array"))?;
+            let data_arr = final_result
+                .get_mut("data")
+                .and_then(|v| v.as_array_mut())
+                .ok_or_else(|| anyhow!("final_result.data missing or not array"))?;
 
-                let row = data_arr.get_mut(row_idx).ok_or_else(|| anyhow!("wallet row missing"))?;
+            let row = data_arr.get_mut(row_idx).ok_or_else(|| anyhow!("wallet row missing"))?;
 
-                let bal_obj = row
-                    .get_mut("balance")
-                    .and_then(|v| v.as_object_mut())
-                    .ok_or_else(|| anyhow!("balance field not an object"))?;
+            let bal_obj = row
+                .get_mut("balance")
+                .and_then(|v| v.as_object_mut())
+                .ok_or_else(|| anyhow!("balance field not an object"))?;
 
-                let chain_obj = bal_obj
-                    .get_mut(net)
-                    .and_then(|v| v.as_object_mut())
-                    .ok_or_else(|| anyhow!("balance.{net} missing or not object"))?;
+            let chain_obj = bal_obj
+                .get_mut(net)
+                .and_then(|v| v.as_object_mut())
+                .ok_or_else(|| anyhow!("balance.{net} missing or not object"))?;
 
-                let native_wei = balances.native.get(w).cloned().unwrap_or_default();
-                let native_str = u256_to_decimal_string(native_wei, NATIVE_DECIMALS, false);
-                chain_obj.insert(native_symbol_for(net).to_string(), json!(native_str));
+            let native_wei = balances.native.get(w).cloned().unwrap_or_default();
+            let native_str = u256_to_decimal_string(native_wei, NATIVE_DECIMALS, false);
+            chain_obj.insert(native_symbol_for(net).to_string(), json!(native_str));
 
-                for token_addr in &cg.contract_addresses {
-                    let raw_bal = balances.erc20
-                        .get(w)
-                        .and_then(|m| m.get(token_addr))
-                        .cloned()
-                        .unwrap_or_default();
+            for token_addr in &cg.contract_addresses {
+                let raw_bal = balances.erc20
+                    .get(w)
+                    .and_then(|m| m.get(token_addr))
+                    .cloned()
+                    .unwrap_or_default();
 
-                    let dec = decimals_map.get(token_addr).cloned().unwrap_or(18);
-                    let s = u256_to_decimal_string(raw_bal, dec, false);
+                let dec = decimals_map.get(token_addr).cloned().unwrap_or(18);
+                let s = u256_to_decimal_string(raw_bal, dec, false);
 
-                    chain_obj.insert(token_addr.clone(), json!(s));
-                }
+                chain_obj.insert(token_addr.clone(), json!(s));
             }
         }
 
@@ -363,51 +384,49 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             native_sum += balances.native.get(w).cloned().unwrap_or_default();
         }
 
-        {
-            let totals_balance_obj = final_result
-                .get_mut("total")
-                .and_then(|v| v.as_object_mut())
-                .and_then(|m| m.get_mut("balance"))
-                .and_then(|v| v.as_object_mut())
-                .ok_or_else(|| anyhow!("final_result.total.balance missing or not object"))?;
+        let totals_balance_obj = final_result
+            .get_mut("total")
+            .and_then(|v| v.as_object_mut())
+            .and_then(|m| m.get_mut("balance"))
+            .and_then(|v| v.as_object_mut())
+            .ok_or_else(|| anyhow!("final_result.total.balance missing or not object"))?;
 
-            let total_chain_obj = totals_balance_obj
-                .get_mut(net)
-                .and_then(|v| v.as_object_mut())
-                .ok_or_else(|| anyhow!("total.balance.{net} missing or not object"))?;
+        let total_chain_obj = totals_balance_obj
+            .get_mut(net)
+            .and_then(|v| v.as_object_mut())
+            .ok_or_else(|| anyhow!("total.balance.{net} missing or not object"))?;
 
-            total_chain_obj.insert(
-                native_symbol_for(net).to_string(),
-                json!(u256_to_decimal_string(native_sum, NATIVE_DECIMALS, false))
-            );
+        total_chain_obj.insert(
+            native_symbol_for(net).to_string(),
+            json!(u256_to_decimal_string(native_sum, NATIVE_DECIMALS, false))
+        );
 
-            for token_addr in &cg.contract_addresses {
-                let mut sum = ethereum_types::U256::zero();
+        for token_addr in &cg.contract_addresses {
+            let mut sum = ethereum_types::U256::zero();
 
-                for w in &req.wallet_addresses {
-                    let v = balances.erc20
-                        .get(w)
-                        .and_then(|m| m.get(token_addr))
-                        .cloned()
-                        .unwrap_or_default();
-                    sum += v;
-                }
-
-                let dec = decimals_map.get(token_addr).cloned().unwrap_or(18);
-                total_chain_obj.insert(
-                    token_addr.clone(),
-                    json!(u256_to_decimal_string(sum, dec, false))
-                );
+            for w in &req.wallet_addresses {
+                let v = balances.erc20
+                    .get(w)
+                    .and_then(|m| m.get(token_addr))
+                    .cloned()
+                    .unwrap_or_default();
+                sum += v;
             }
+
+            let dec = decimals_map.get(token_addr).cloned().unwrap_or(18);
+            total_chain_obj.insert(
+                token_addr.clone(),
+                json!(u256_to_decimal_string(sum, dec, false))
+            );
         }
 
         // per-network timing + counters
         EVM_NET_OK.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(
-            network=%net,
-            elapsed_ms=net_start.elapsed().as_millis(),
-            evm_ok=EVM_NET_OK.load(Ordering::Relaxed),
-            evm_fail=EVM_NET_FAIL.load(Ordering::Relaxed),
+            network = %net,
+            elapsed_ms = net_start.elapsed().as_millis(),
+            evm_ok = EVM_NET_OK.load(Ordering::Relaxed),
+            evm_fail = EVM_NET_FAIL.load(Ordering::Relaxed),
             "evm network processed"
         );
 
@@ -446,7 +465,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
 
             let lamports = sol_rpc.get_balance_lamports(w).await.unwrap_or_else(|e| {
                 SOL_NET_FAIL.fetch_add(1, Ordering::Relaxed);
-                tracing::error!(wallet=%w, error=%e, "sol getBalance failed -> keeping zero");
+                tracing::error!(wallet = %w, error = %e, "sol getBalance failed -> keeping zero");
                 0u64
             });
 
@@ -478,22 +497,30 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
 
             // SPL mints provided by request contracts (networkName="sol")
             for mint in &sol_mints {
+                if !is_valid_solana_pubkey_32(mint) {
+                    // Defensive: snapshot may contain older junk; don't spam RPC
+                    tracing::warn!(mint = %mint, "invalid sol mint in snapshot -> skipped");
+                    continue;
+                }
+
                 let (amt_u128, dec_u32) = sol_rpc
                     .get_spl_balance_by_owner_mint(w, mint).await
                     .unwrap_or_else(|e| {
                         SOL_NET_FAIL.fetch_add(1, Ordering::Relaxed);
-                        tracing::error!(wallet=%w, mint=%mint, error=%e, "sol spl fetch failed -> keeping zero");
+                        tracing::error!(
+                            wallet = %w,
+                            mint = %mint,
+                            error = %e,
+                            "sol spl fetch failed -> keeping zero"
+                        );
                         (0u128, 0u32)
                     });
 
-                // decimals=0 could mean "no account exists"; we still store 0 with fixed 18.
-                // If RPC returned 0 decimals for real token, it’s rare; but fail-soft is fine.
                 spl_decimals.entry(mint.clone()).or_insert(dec_u32);
                 *spl_totals.entry(mint.clone()).or_insert(0u128) += amt_u128;
 
                 let formatted = u128_base_units_to_fixed_18(amt_u128, dec_u32);
 
-                // write into row.balance.sol.<mint>
                 let data_arr = final_result
                     .get_mut("data")
                     .and_then(|v| v.as_array_mut())
@@ -554,13 +581,15 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
     }
 
     // Update snapshot (final_result is fully-shaped)
+    // ✅ Also overwrite normalizedRequest with sanitized version (heals poisoned snapshots)
     snapshots.update_one(
         doc! { "requestKey": request_key },
         doc! {
                 "$set": {
                     "lastUpdatedAt": now,
                     "refreshState": "idle",
-                    "result": bson::to_bson(&final_result).unwrap_or(bson::Bson::Null)
+                    "result": bson::to_bson(&final_result).unwrap_or(bson::Bson::Null),
+                    "normalizedRequest": bson::to_bson(&req_sanitized_json).unwrap_or(bson::Bson::Null)
                 }
             }
     ).await?;

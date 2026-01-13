@@ -1,14 +1,19 @@
 use crate::core::key::request_key_from_canonical_json;
 use crate::core::normalize::normalize_request;
-use crate::db::{refresh_jobs, snapshots};
-use crate::http::dto::{zero_result_from_request, BalanceRequest, BalanceResponse};
+use crate::db::{ refresh_jobs, snapshots };
+use crate::http::dto::{ zero_result_from_request, BalanceRequest, BalanceResponse };
+use crate::http::error::ApiError;
+use crate::http::validate::{ validate_normalized_request, validate_request_limits };
 use crate::AppState;
 
-use axum::{extract::State, Json};
+use axum::{ extract::State, http::StatusCode, response::IntoResponse, Json };
 use bson::DateTime;
 use serde_json::json;
 
 const STALE_AFTER_SECS: i64 = 30;
+
+/// Hard refresh cooldown (prevents hammering)
+const HARD_REFRESH_COOLDOWN_SECS: i64 = 10;
 
 pub async fn health() -> &'static str {
     "ok"
@@ -16,9 +21,21 @@ pub async fn health() -> &'static str {
 
 pub async fn get_multi_wallet_balances(
     State(state): State<AppState>,
-    Json(req): Json<BalanceRequest>,
-) -> Json<BalanceResponse> {
+    Json(req): Json<BalanceRequest>
+) -> impl IntoResponse {
+    // 1) Validate raw limits first (cheap anti-abuse)
+    if let Err(e) = validate_request_limits(&req) {
+        return e.into_response();
+    }
+
+    // 2) Normalize
     let normalized = normalize_request(&req);
+
+    // 3) Validate normalized request (addresses, networks, work units)
+    if let Err(e) = validate_normalized_request(&normalized) {
+        return e.into_response();
+    }
+
     let canonical = serde_json::to_string(&normalized).unwrap_or_else(|_| "{}".to_string());
     let request_key = request_key_from_canonical_json(&canonical);
 
@@ -51,7 +68,14 @@ pub async fn get_multi_wallet_balances(
                 "snapshot hit"
             );
 
-            if is_stale || normalized.hard_refresh {
+            // Hard refresh cooldown to prevent spam
+            let hard_refresh_allowed = if normalized.hard_refresh {
+                age_secs >= HARD_REFRESH_COOLDOWN_SECS
+            } else {
+                true
+            };
+
+            if (is_stale || normalized.hard_refresh) && hard_refresh_allowed {
                 match refresh_jobs::enqueue_or_requeue(&state.mongo.db, &request_key).await {
                     Ok(did_queue) => {
                         tracing::info!(
@@ -64,9 +88,8 @@ pub async fn get_multi_wallet_balances(
                             let _ = snapshots::set_refresh_state(
                                 &state.mongo.db,
                                 &request_key,
-                                "queued",
-                            )
-                            .await;
+                                "queued"
+                            ).await;
                         }
                     }
                     Err(e) => {
@@ -77,12 +100,20 @@ pub async fn get_multi_wallet_balances(
                         );
                     }
                 }
+            } else if normalized.hard_refresh && !hard_refresh_allowed {
+                tracing::debug!(
+                    request_key = %request_key,
+                    age_secs = age_secs,
+                    cooldown_secs = HARD_REFRESH_COOLDOWN_SECS,
+                    "hard_refresh skipped due to cooldown"
+                );
             }
 
             Json(BalanceResponse {
                 status: true,
                 result: doc.result,
-            })
+                error: None,
+            }).into_response()
         }
 
         Ok(None) => {
@@ -94,13 +125,13 @@ pub async fn get_multi_wallet_balances(
             let normalized_json = serde_json::to_value(&normalized).unwrap_or(json!({}));
             let zero_result = zero_result_from_request(&normalized);
 
-            if let Err(e) = snapshots::upsert_empty_snapshot(
-                &state.mongo.db,
-                &request_key,
-                normalized_json,
-                zero_result.clone(),
-            )
-            .await
+            if
+                let Err(e) = snapshots::upsert_empty_snapshot(
+                    &state.mongo.db,
+                    &request_key,
+                    normalized_json,
+                    zero_result.clone()
+                ).await
             {
                 tracing::error!(
                     request_key=%request_key,
@@ -118,12 +149,15 @@ pub async fn get_multi_wallet_balances(
                     );
 
                     if did_queue {
-                        let _ =
-                            snapshots::set_refresh_state(&state.mongo.db, &request_key, "queued")
-                                .await;
+                        let _ = snapshots::set_refresh_state(
+                            &state.mongo.db,
+                            &request_key,
+                            "queued"
+                        ).await;
                     }
                 }
-                Err(e) => tracing::error!(
+                Err(e) =>
+                    tracing::error!(
                     request_key=%request_key,
                     error=%e,
                     "failed to enqueue refresh job"
@@ -133,7 +167,8 @@ pub async fn get_multi_wallet_balances(
             Json(BalanceResponse {
                 status: true,
                 result: zero_result,
-            })
+                error: None,
+            }).into_response()
         }
 
         Err(e) => {
@@ -143,13 +178,36 @@ pub async fn get_multi_wallet_balances(
                 "snapshot fetch error (fail-soft)"
             );
 
-            // IMPORTANT: still return standard-shaped zeros
+            // Still return standard-shaped zeros (but this is server-side issue)
             let zero_result = zero_result_from_request(&normalized);
 
+            // You *could* also include an error meta here, but per your current contract we keep status=true
             Json(BalanceResponse {
                 status: true,
                 result: zero_result,
-            })
+                error: None,
+            }).into_response()
         }
     }
+}
+
+/// OPTIONAL: If you ever want to return errors explicitly from inside this handler:
+#[allow(dead_code)]
+fn bad_request(
+    code: &str,
+    message: &str,
+    details: serde_json::Value
+) -> (StatusCode, Json<BalanceResponse>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(BalanceResponse {
+            status: false,
+            result: json!({}),
+            error: Some(crate::http::error::ApiErrorBody {
+                code: code.to_string(),
+                message: message.to_string(),
+                details: Some(details),
+            }),
+        }),
+    )
 }
