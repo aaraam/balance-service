@@ -2,8 +2,12 @@
 // balance-service\src\http\error.rs
 // ==================================================
 
-use axum::{ http::StatusCode, response::{ IntoResponse, Response }, Json };
-use serde::{ Deserialize, Serialize };
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,7 +28,7 @@ impl ApiError {
     pub fn bad_request(
         code: impl Into<String>,
         message: impl Into<String>,
-        details: Option<Value>
+        details: Option<Value>,
     ) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -39,7 +43,7 @@ impl ApiError {
     pub fn too_many_requests(
         code: impl Into<String>,
         message: impl Into<String>,
-        details: Option<Value>
+        details: Option<Value>,
     ) -> Self {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,

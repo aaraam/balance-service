@@ -1,12 +1,11 @@
 use crate::core::key::request_key_from_canonical_json;
 use crate::core::normalize::normalize_request;
-use crate::db::{ refresh_jobs, snapshots };
-use crate::http::dto::{ zero_result_from_request, BalanceRequest, BalanceResponse };
-use crate::http::error::ApiError;
-use crate::http::validate::{ validate_normalized_request, validate_request_limits };
+use crate::db::{refresh_jobs, snapshots};
+use crate::http::dto::{zero_result_from_request, BalanceRequest, BalanceResponse};
+use crate::http::validate::{validate_normalized_request, validate_request_limits};
 use crate::AppState;
 
-use axum::{ extract::State, http::StatusCode, response::IntoResponse, Json };
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use bson::DateTime;
 use serde_json::json;
 
@@ -21,7 +20,7 @@ pub async fn health() -> &'static str {
 
 pub async fn get_multi_wallet_balances(
     State(state): State<AppState>,
-    Json(req): Json<BalanceRequest>
+    Json(req): Json<BalanceRequest>,
 ) -> impl IntoResponse {
     // 1) Validate raw limits first (cheap anti-abuse)
     if let Err(e) = validate_request_limits(&req) {
@@ -44,6 +43,7 @@ pub async fn get_multi_wallet_balances(
         hard_refresh = normalized.hard_refresh,
         evm_wallets = normalized.wallet_addresses.len(),
         sol_wallets = normalized.solana_wallet_addresses.len(),
+        tron_wallets = normalized.tron_wallet_addresses.len(),
         doge_wallets = normalized.doge_wallet_addresses.len(),
         btc_wallets = normalized.btc_wallet_addresses.len(),
         contracts = ?normalized.contracts
@@ -88,8 +88,9 @@ pub async fn get_multi_wallet_balances(
                             let _ = snapshots::set_refresh_state(
                                 &state.mongo.db,
                                 &request_key,
-                                "queued"
-                            ).await;
+                                "queued",
+                            )
+                            .await;
                         }
                     }
                     Err(e) => {
@@ -113,7 +114,8 @@ pub async fn get_multi_wallet_balances(
                 status: true,
                 result: doc.result,
                 error: None,
-            }).into_response()
+            })
+            .into_response()
         }
 
         Ok(None) => {
@@ -125,13 +127,13 @@ pub async fn get_multi_wallet_balances(
             let normalized_json = serde_json::to_value(&normalized).unwrap_or(json!({}));
             let zero_result = zero_result_from_request(&normalized);
 
-            if
-                let Err(e) = snapshots::upsert_empty_snapshot(
-                    &state.mongo.db,
-                    &request_key,
-                    normalized_json,
-                    zero_result.clone()
-                ).await
+            if let Err(e) = snapshots::upsert_empty_snapshot(
+                &state.mongo.db,
+                &request_key,
+                normalized_json,
+                zero_result.clone(),
+            )
+            .await
             {
                 tracing::error!(
                     request_key=%request_key,
@@ -149,15 +151,12 @@ pub async fn get_multi_wallet_balances(
                     );
 
                     if did_queue {
-                        let _ = snapshots::set_refresh_state(
-                            &state.mongo.db,
-                            &request_key,
-                            "queued"
-                        ).await;
+                        let _ =
+                            snapshots::set_refresh_state(&state.mongo.db, &request_key, "queued")
+                                .await;
                     }
                 }
-                Err(e) =>
-                    tracing::error!(
+                Err(e) => tracing::error!(
                     request_key=%request_key,
                     error=%e,
                     "failed to enqueue refresh job"
@@ -168,7 +167,8 @@ pub async fn get_multi_wallet_balances(
                 status: true,
                 result: zero_result,
                 error: None,
-            }).into_response()
+            })
+            .into_response()
         }
 
         Err(e) => {
@@ -186,7 +186,8 @@ pub async fn get_multi_wallet_balances(
                 status: true,
                 result: zero_result,
                 error: None,
-            }).into_response()
+            })
+            .into_response()
         }
     }
 }
@@ -196,7 +197,7 @@ pub async fn get_multi_wallet_balances(
 fn bad_request(
     code: &str,
     message: &str,
-    details: serde_json::Value
+    details: serde_json::Value,
 ) -> (StatusCode, Json<BalanceResponse>) {
     (
         StatusCode::BAD_REQUEST,

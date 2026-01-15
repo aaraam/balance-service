@@ -30,9 +30,44 @@ fn is_valid_solana_pubkey_32(s: &str) -> bool {
     }
     let decoded = match bs58::decode(t).into_vec() {
         Ok(v) => v,
-        Err(_) => return false,
+        Err(_) => {
+            return false;
+        }
     };
     decoded.len() == 32
+}
+
+fn is_valid_tron_base58_addr(s: &str) -> bool {
+    use sha2::{Digest, Sha256};
+
+    let t = s.trim();
+    if t.is_empty() || !t.starts_with('T') {
+        return false;
+    }
+
+    // TRON base58check decode => 25 bytes (21 payload + 4 checksum)
+    let decoded = match bs58::decode(t).into_vec() {
+        Ok(v) => v,
+        Err(_) => {
+            return false;
+        }
+    };
+
+    if decoded.len() != 25 {
+        return false;
+    }
+
+    // payload = 21 bytes: [0x41][20 bytes addr]
+    let (payload, checksum) = decoded.split_at(21);
+
+    if payload.first().copied() != Some(0x41) {
+        return false;
+    }
+
+    // checksum = first 4 bytes of sha256d(payload)
+    let h1 = Sha256::digest(payload);
+    let h2 = Sha256::digest(&h1);
+    checksum == &h2[..4]
 }
 
 pub fn normalize_request(req: &BalanceRequest) -> BalanceRequest {
@@ -65,6 +100,19 @@ pub fn normalize_request(req: &BalanceRequest) -> BalanceRequest {
     sol_wallets.dedup();
 
     // -----------------------
+    // Normalize + SANITIZE TRON wallets (base58check, trim only)
+    // -----------------------
+    let mut tron_wallets: Vec<String> = req
+        .tron_wallet_addresses
+        .iter()
+        .map(|w| w.trim().to_string())
+        .filter(|w| is_valid_tron_base58_addr(w))
+        .collect();
+
+    tron_wallets.sort();
+    tron_wallets.dedup();
+
+    // -----------------------
     // Normalize contracts per network, DROP ignored networks,
     // and DROP unsupported networks + invalid addresses
     // -----------------------
@@ -79,9 +127,8 @@ pub fn normalize_request(req: &BalanceRequest) -> BalanceRequest {
                 return None;
             }
 
-            // only allow: "sol" OR supported EVM networks
-            if net != "sol" && !evm_supported.contains_key(net.as_str()) {
-                // unsupported network -> drop silently (fail-soft)
+            // only allow: "sol" OR "trx" OR supported EVM networks
+            if net != "sol" && net != "trx" && !evm_supported.contains_key(net.as_str()) {
                 return None;
             }
 
@@ -92,6 +139,13 @@ pub fn normalize_request(req: &BalanceRequest) -> BalanceRequest {
                     .iter()
                     .map(|a| a.trim().to_string())
                     .filter(|a| is_valid_solana_pubkey_32(a))
+                    .collect()
+            } else if net == "trx" {
+                // TRON TRC20 contracts are base58check and case-sensitive-ish => DO NOT lowercase
+                c.contract_addresses
+                    .iter()
+                    .map(|a| a.trim().to_string())
+                    .filter(|a| is_valid_tron_base58_addr(a))
                     .collect()
             } else {
                 // EVM contract addresses => lowercase ok
@@ -104,12 +158,6 @@ pub fn normalize_request(req: &BalanceRequest) -> BalanceRequest {
 
             addrs.sort();
             addrs.dedup();
-
-            // If group ends up empty, drop it.
-            // (If you want "native only" even when tokens are empty, remove this block.)
-            if addrs.is_empty() {
-                return None;
-            }
 
             Some(ContractGroup {
                 network_name: net,
@@ -125,6 +173,7 @@ pub fn normalize_request(req: &BalanceRequest) -> BalanceRequest {
         contracts,
         wallet_addresses: evm_wallets,
         solana_wallet_addresses: sol_wallets,
+        tron_wallet_addresses: tron_wallets,
         // keep for backward compat but always empty (as you already do)
         doge_wallet_addresses: vec![],
         btc_wallet_addresses: vec![],

@@ -5,6 +5,7 @@ mod db;
 mod evm;
 mod http;
 mod solana;
+mod tron;
 mod worker;
 
 use axum::{

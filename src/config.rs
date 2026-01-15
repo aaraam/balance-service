@@ -21,6 +21,11 @@ pub struct AppConfig {
 
     // NEW: outbound HTTP timeout for RPC calls (EVM + SOL)
     pub rpc_timeout_ms: u64,
+
+    // ───────── TRON ─────────
+    pub tron_fullnode_url: String,
+    pub tron_solidity_url: String,
+    pub tron_api_key: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -61,11 +66,16 @@ impl AppConfig {
         let solana_rpc_url = std::env::var("SOLANA_RPC_URL")
             .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
 
-        // NEW
         let rpc_timeout_ms = std::env::var("RPC_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(12_000);
+
+        let tron_fullnode_url = std::env::var("TRON_FULLNODE_URL").unwrap_or_default();
+
+        let tron_solidity_url = std::env::var("TRON_SOLIDITY_URL").unwrap_or_default();
+
+        let tron_api_key = std::env::var("TRON_TEMP_KEY").ok();
 
         Ok(Self {
             bind_addr,
@@ -77,6 +87,9 @@ impl AppConfig {
             worker_slow_ms,
             solana_rpc_url,
             rpc_timeout_ms,
+            tron_fullnode_url,
+            tron_solidity_url,
+            tron_api_key,
         })
     }
 }

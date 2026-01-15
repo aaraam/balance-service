@@ -94,7 +94,7 @@ impl ChainKey {
 // Central source of truth: networks we IGNORE even if client sends them.
 // NOTE: sol is no longer ignored (Phase 6).
 pub fn is_ignored_network(network_name: &str) -> bool {
-    matches!(network_name, "trx" | "btc" | "doge")
+    matches!(network_name, "btc" | "doge")
 }
 
 pub fn supported_evm_networks() -> HashMap<&'static str, ChainKey> {
