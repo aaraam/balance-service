@@ -1,3 +1,7 @@
+// ==================================================
+// balance-service\src\db\snapshots.rs
+// ==================================================
+
 use crate::db::models::BalanceSnapshotDoc;
 use bson::doc;
 use mongodb::Collection;
@@ -49,7 +53,9 @@ pub async fn upsert_empty_snapshot(
             "result": bson::to_bson(&empty_result_json)
                 .unwrap_or(bson::Bson::Null),
             "lastUpdatedAt": now,
-            "refreshState": "idle"
+            "refreshState": "idle",
+            "isComplete": false,
+            "hasChanged": true 
         }
     };
 
@@ -58,10 +64,7 @@ pub async fn upsert_empty_snapshot(
     Ok(())
 }
 
-/// ===============================
-/// NEW — Phase 4 helper
 /// Keeps snapshot state consistent
-/// ===============================
 pub async fn set_refresh_state(
     db: &mongodb::Database,
     request_key: &str,

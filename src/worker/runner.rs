@@ -5,7 +5,7 @@
 use crate::AppState;
 use anyhow::anyhow;
 use bson::{ doc, DateTime };
-use futures::stream::{ self, StreamExt }; // ✅ Required for parallel Tron calls
+use futures::stream::{ self, StreamExt }; 
 use mongodb::options::{ FindOneAndUpdateOptions, ReturnDocument };
 use serde_json::json;
 
@@ -28,16 +28,10 @@ use std::time::Instant;
 const MAX_CALLS_PER_BATCH: usize = 600;
 
 /// Limits concurrent HTTP requests to Tron to avoid hitting API rate limits.
-/// 20 is usually safe for public/free-tier nodes. Increase if using a paid dedicated node.
 const TRON_CONCURRENCY_LIMIT: usize = 5;
 
-/// IMPORTANT: fixed 18-decimal strings for native too (NO trim)
 const NATIVE_DECIMALS: u32 = 18;
-
-// SOL uses 9 decimals (lamports). We output 18-decimal fixed strings.
 const SOL_DECIMALS: u32 = 9;
-
-// TRX uses 6 decimals (sun). Output fixed 18-decimal strings.
 const TRX_DECIMALS: u32 = 6;
 
 // --- ultra-light metrics (process-local) ---
@@ -74,13 +68,10 @@ fn native_symbol_for(network: &str) -> &str {
         "bnb" => "bnb",
         "matic" => "matic",
         "op" => "op",
-        _ => network, // avax/ftm/cro/etc
+        _ => network, 
     }
 }
 
-// Convert base-units (u128) to fixed-decimals string, then pad/truncate to 18 decimals.
-// - `decimals` is the asset decimals (e.g., SOL=9, TRX=6, SPL mint decimals vary)
-// - output is fixed 18 decimals (no trim)
 fn u128_base_units_to_fixed_18(value: u128, decimals: u32) -> String {
     if decimals == 0 {
         return format!("{}.{}", value, "0".repeat(18));
@@ -112,12 +103,10 @@ fn u128_base_units_to_fixed_18(value: u128, decimals: u32) -> String {
     format!("{}.{}", whole, frac_str)
 }
 
-// Convert lamports(u128) -> fixed 18-decimal SOL string.
 fn lamports_u128_to_sol_fixed_18(lamports: u128) -> String {
     u128_base_units_to_fixed_18(lamports, SOL_DECIMALS)
 }
 
-// Convert sun(u128) -> fixed 18-decimal TRX string.
 fn sun_u128_to_trx_fixed_18(sun: u128) -> String {
     u128_base_units_to_fixed_18(sun, TRX_DECIMALS)
 }
@@ -232,35 +221,35 @@ async fn claim_next_job(state: &AppState) -> Result<Option<String>, mongodb::err
 }
 
 async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::Error> {
-    let snapshots = state
-        .mongo
-        .db
-        .collection::<bson::Document>("balance_snapshots");
+    let snapshots = state.mongo.db.collection::<bson::Document>("balance_snapshots");
     let now = DateTime::now();
 
     // Mark snapshot running
-    snapshots
-        .update_one(
-            doc! { "requestKey": request_key },
-            doc! { "$set": { "refreshState": "running" } },
-        )
-        .await?;
+    snapshots.update_one(
+        doc! { "requestKey": request_key },
+        doc! { "$set": { "refreshState": "running", "isComplete": false } }
+    ).await?;
 
     // Load snapshot doc
     let snap = snapshots
-        .find_one(doc! { "requestKey": request_key })
-        .await?
+        .find_one(doc! { "requestKey": request_key }).await?
         .ok_or_else(|| anyhow!("snapshot not found for requestKey"))?;
 
-    let normalized_req_bson = snap
-        .get("normalizedRequest")
+    // ✅ CAPTURE INITIAL STATE FOR CHANGE DETECTION
+    let initial_result_json: serde_json::Value = snap
+        .get("result")
         .cloned()
-        .unwrap_or(bson::Bson::Null);
+        .and_then(|b| bson::from_bson(b).ok())
+        .unwrap_or(json!({}));
 
-    let normalized_req_json: serde_json::Value =
-        bson::from_bson(normalized_req_bson).unwrap_or_else(|_| json!({}));
+    let normalized_req_bson = snap.get("normalizedRequest").cloned().unwrap_or(bson::Bson::Null);
 
-    let req_raw: BalanceRequest = serde_json::from_value(normalized_req_json.clone())
+    let normalized_req_json: serde_json::Value = bson
+        ::from_bson(normalized_req_bson)
+        .unwrap_or_else(|_| json!({}));
+
+    let req_raw: BalanceRequest = serde_json
+        ::from_value(normalized_req_json.clone())
         .unwrap_or_else(|_| BalanceRequest {
             hard_refresh: false,
             contracts: vec![],
@@ -280,8 +269,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
     // 1. Start with a fresh ZERO result shape (Contract Truth)
     let mut final_result = zero_result_from_request(&req);
 
-    // 2. ✅ FIX 1: Use `if let Some` instead of `if let Ok`
-    //    Overlay existing DB result if present to prevent flashing zeroes.
+    // Overlay existing DB result if present to prevent flashing zeroes.
     if let Some(existing_bson) = snap.get("result") {
         if existing_bson != &bson::Bson::Null {
             if let Ok(existing_json) = bson::from_bson::<serde_json::Value>(existing_bson.clone()) {
@@ -291,24 +279,21 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
     }
 
     // Row indices
-    let evm_wallet_index: std::collections::HashMap<String, usize> = req
-        .wallet_addresses
+    let evm_wallet_index: std::collections::HashMap<String, usize> = req.wallet_addresses
         .iter()
         .enumerate()
         .map(|(i, w)| (w.clone(), i))
         .collect();
 
     let sol_offset = req.wallet_addresses.len();
-    let sol_wallet_index: std::collections::HashMap<String, usize> = req
-        .solana_wallet_addresses
+    let sol_wallet_index: std::collections::HashMap<String, usize> = req.solana_wallet_addresses
         .iter()
         .enumerate()
         .map(|(i, w)| (w.clone(), sol_offset + i))
         .collect();
 
     let tron_offset = sol_offset + req.solana_wallet_addresses.len();
-    let tron_wallet_index: std::collections::HashMap<String, usize> = req
-        .tron_wallet_addresses
+    let tron_wallet_index: std::collections::HashMap<String, usize> = req.tron_wallet_addresses
         .iter()
         .enumerate()
         .map(|(i, w)| (w.clone(), tron_offset + i))
@@ -341,13 +326,13 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         let rpc_url = chain.thirdweb_rpc_url(&state.cfg.thirdweb_client_id);
         let rpc = RpcClient::new(rpc_url, state.cfg.rpc_timeout_ms);
 
-        let balances: EvmBalances = match fetch_balances_multicall3(
-            &rpc,
-            &req.wallet_addresses,
-            &cg.contract_addresses,
-            MAX_CALLS_PER_BATCH,
-        )
-        .await
+        let balances: EvmBalances = match
+            fetch_balances_multicall3(
+                &rpc,
+                &req.wallet_addresses,
+                &cg.contract_addresses,
+                MAX_CALLS_PER_BATCH
+            ).await
         {
             Ok(b) => b,
             Err(e) => {
@@ -360,16 +345,12 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                     evm_fail = EVM_NET_FAIL.load(Ordering::Relaxed),
                     "evm fetch failed -> keeping previous val or zeros"
                 );
-                continue; 
+                continue;
             }
         };
 
-        let decimals_map = match fetch_token_decimals_multicall3(
-            &rpc,
-            &cg.contract_addresses,
-            MAX_CALLS_PER_BATCH,
-        )
-        .await
+        let decimals_map = match
+            fetch_token_decimals_multicall3(&rpc, &cg.contract_addresses, MAX_CALLS_PER_BATCH).await
         {
             Ok(m) => m,
             Err(e) => {
@@ -388,9 +369,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                 .and_then(|v| v.as_array_mut())
                 .ok_or_else(|| anyhow!("final_result.data missing or not array"))?;
 
-            let row = data_arr
-                .get_mut(row_idx)
-                .ok_or_else(|| anyhow!("wallet row missing"))?;
+            let row = data_arr.get_mut(row_idx).ok_or_else(|| anyhow!("wallet row missing"))?;
 
             let bal_obj = row
                 .get_mut("balance")
@@ -410,8 +389,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             chain_obj.insert(native_symbol_for(net).to_string(), json!(native_str));
 
             for token_addr in &cg.contract_addresses {
-                let raw_bal = balances
-                    .erc20
+                let raw_bal = balances.erc20
                     .get(w)
                     .and_then(|m| m.get(token_addr))
                     .cloned()
@@ -436,7 +414,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             .and_then(|m| m.get_mut("balance"))
             .and_then(|v| v.as_object_mut())
             .ok_or_else(|| anyhow!("final_result.total.balance missing or not object"))?;
-        
+
         if !totals_balance_obj.contains_key(net) {
             totals_balance_obj.insert(net.to_string(), json!({}));
         }
@@ -448,15 +426,14 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
 
         total_chain_obj.insert(
             native_symbol_for(net).to_string(),
-            json!(u256_to_decimal_string(native_sum, NATIVE_DECIMALS, false)),
+            json!(u256_to_decimal_string(native_sum, NATIVE_DECIMALS, false))
         );
 
         for token_addr in &cg.contract_addresses {
             let mut sum = ethereum_types::U256::zero();
 
             for w in &req.wallet_addresses {
-                let v = balances
-                    .erc20
+                let v = balances.erc20
                     .get(w)
                     .and_then(|m| m.get(token_addr))
                     .cloned()
@@ -467,7 +444,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             let dec = decimals_map.get(token_addr).cloned().unwrap_or(18);
             total_chain_obj.insert(
                 token_addr.clone(),
-                json!(u256_to_decimal_string(sum, dec, false)),
+                json!(u256_to_decimal_string(sum, dec, false))
             );
         }
 
@@ -485,20 +462,18 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         }
     }
 
-    // ✅ OPTION 1: INCREMENTAL UPDATE #1 (EVM DONE)
-    snapshots
-        .update_one(
-            doc! { "requestKey": request_key },
-            doc! {
+    snapshots.update_one(
+        doc! { "requestKey": request_key },
+        doc! {
                 "$set": {
                     "lastUpdatedAt": DateTime::now(),
                     "refreshState": "running",
+                    "isComplete": false,
                     "result": bson::to_bson(&final_result).unwrap_or(bson::Bson::Null),
                     "normalizedRequest": bson::to_bson(&req_sanitized_json).unwrap_or(bson::Bson::Null)
                 }
-            },
-        )
-        .await?;
+            }
+    ).await?;
     tracing::debug!(request_key = %request_key, "incremental DB update (EVM done)");
 
     // ==========================
@@ -506,16 +481,22 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
     // ==========================
     if !req.solana_wallet_addresses.is_empty() {
         let sol_start = Instant::now();
-        let sol_rpc =
-            SolanaRpcClient::new(state.cfg.solana_rpc_url.clone(), state.cfg.rpc_timeout_ms);
+        let sol_rpc = SolanaRpcClient::new(
+            state.cfg.solana_rpc_url.clone(),
+            state.cfg.rpc_timeout_ms
+        );
 
         let sol_mints = sol_mints_from_request(&req);
 
         let mut sol_total_lamports: u128 = 0;
-        let mut spl_totals: std::collections::HashMap<String, u128> =
-            std::collections::HashMap::new();
-        let mut spl_decimals: std::collections::HashMap<String, u32> =
-            std::collections::HashMap::new();
+        let mut spl_totals: std::collections::HashMap<
+            String,
+            u128
+        > = std::collections::HashMap::new();
+        let mut spl_decimals: std::collections::HashMap<
+            String,
+            u32
+        > = std::collections::HashMap::new();
 
         for w in &req.solana_wallet_addresses {
             let row_idx = *sol_wallet_index
@@ -536,9 +517,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                     .and_then(|v| v.as_array_mut())
                     .ok_or_else(|| anyhow!("final_result.data missing or not array"))?;
 
-                let row = data_arr
-                    .get_mut(row_idx)
-                    .ok_or_else(|| anyhow!("wallet row missing"))?;
+                let row = data_arr.get_mut(row_idx).ok_or_else(|| anyhow!("wallet row missing"))?;
 
                 let bal_obj = row
                     .get_mut("balance")
@@ -546,7 +525,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                     .ok_or_else(|| anyhow!("balance field not an object"))?;
 
                 if !bal_obj.contains_key("sol") {
-                     bal_obj.insert("sol".to_string(), json!({}));
+                    bal_obj.insert("sol".to_string(), json!({}));
                 }
                 let sol_obj = bal_obj
                     .get_mut("sol")
@@ -555,7 +534,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
 
                 sol_obj.insert(
                     "sol".to_string(),
-                    json!(lamports_u128_to_sol_fixed_18(lamports as u128)),
+                    json!(lamports_u128_to_sol_fixed_18(lamports as u128))
                 );
             }
 
@@ -566,8 +545,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                 }
 
                 let (amt_u128, dec_u32) = sol_rpc
-                    .get_spl_balance_by_owner_mint(w, mint)
-                    .await
+                    .get_spl_balance_by_owner_mint(w, mint).await
                     .unwrap_or_else(|e| {
                         SOL_NET_FAIL.fetch_add(1, Ordering::Relaxed);
                         tracing::error!(
@@ -597,16 +575,14 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                     .get_mut("data")
                     .and_then(|v| v.as_array_mut())
                     .ok_or_else(|| anyhow!("final_result.data missing or not array"))?;
-                let row = data_arr
-                    .get_mut(row_idx)
-                    .ok_or_else(|| anyhow!("wallet row missing"))?;
+                let row = data_arr.get_mut(row_idx).ok_or_else(|| anyhow!("wallet row missing"))?;
                 let bal_obj = row
                     .get_mut("balance")
                     .and_then(|v| v.as_object_mut())
                     .ok_or_else(|| anyhow!("balance field not an object"))?;
-                
+
                 if !bal_obj.contains_key("sol") {
-                     bal_obj.insert("sol".to_string(), json!({}));
+                    bal_obj.insert("sol".to_string(), json!({}));
                 }
                 let sol_obj = bal_obj
                     .get_mut("sol")
@@ -626,21 +602,25 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                 .ok_or_else(|| anyhow!("final_result.total.balance missing or not object"))?;
 
             if !totals_balance_obj.contains_key("sol") {
-                 totals_balance_obj.insert("sol".to_string(), json!({}));
+                totals_balance_obj.insert("sol".to_string(), json!({}));
             }
-            if let Some(sol_total_obj) = totals_balance_obj
-                .get_mut("sol")
-                .and_then(|v| v.as_object_mut())
+            if
+                let Some(sol_total_obj) = totals_balance_obj
+                    .get_mut("sol")
+                    .and_then(|v| v.as_object_mut())
             {
                 sol_total_obj.insert(
                     "sol".to_string(),
-                    json!(lamports_u128_to_sol_fixed_18(sol_total_lamports)),
+                    json!(lamports_u128_to_sol_fixed_18(sol_total_lamports))
                 );
 
                 for mint in &sol_mints {
                     let sum = spl_totals.get(mint).cloned().unwrap_or(0u128);
                     let dec = spl_decimals.get(mint).cloned().unwrap_or(0u32);
-                    sol_total_obj.insert(mint.clone(), json!(u128_base_units_to_fixed_18(sum, dec)));
+                    sol_total_obj.insert(
+                        mint.clone(),
+                        json!(u128_base_units_to_fixed_18(sum, dec))
+                    );
                 }
             }
         }
@@ -654,21 +634,20 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             wallets = req.solana_wallet_addresses.len(),
             "sol network processed"
         );
-        
+
         // ✅ INCREMENTAL UPDATE #2: SOLANA DONE
-        snapshots
-            .update_one(
-                doc! { "requestKey": request_key },
-                doc! {
+        snapshots.update_one(
+            doc! { "requestKey": request_key },
+            doc! {
                     "$set": {
                         "lastUpdatedAt": DateTime::now(),
                         "refreshState": "running",
+                        "isComplete": false,
                         "result": bson::to_bson(&final_result).unwrap_or(bson::Bson::Null),
                         "normalizedRequest": bson::to_bson(&req_sanitized_json).unwrap_or(bson::Bson::Null)
                     }
-                },
-            )
-            .await?;
+                }
+        ).await?;
         tracing::debug!(request_key = %request_key, "incremental DB update (Solana done)");
     }
 
@@ -678,7 +657,9 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
     let tron_contracts = tron_contracts_from_request(&req);
     let tron_requested = !req.tron_wallet_addresses.is_empty() || !tron_contracts.is_empty();
 
-    if tron_requested && (!req.tron_wallet_addresses.is_empty() || !req.wallet_addresses.is_empty())
+    if
+        tron_requested &&
+        (!req.tron_wallet_addresses.is_empty() || !req.wallet_addresses.is_empty())
     {
         let trx_start = Instant::now();
 
@@ -686,15 +667,19 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             state.cfg.tron_fullnode_url.clone(),
             state.cfg.tron_solidity_url.clone(),
             state.cfg.tron_api_key.clone(),
-            state.cfg.rpc_timeout_ms,
+            state.cfg.rpc_timeout_ms
         );
 
-        let mut dec_cache: std::collections::HashMap<String, u32> =
-            std::collections::HashMap::new();
+        let mut dec_cache: std::collections::HashMap<
+            String,
+            u32
+        > = std::collections::HashMap::new();
 
         let mut trx_total_sun: u128 = 0;
-        let mut trc20_totals: std::collections::HashMap<String, u128> =
-            std::collections::HashMap::new();
+        let mut trc20_totals: std::collections::HashMap<
+            String,
+            u128
+        > = std::collections::HashMap::new();
 
         let (wallets_for_tron, row_index_lookup, derived_from_evm): (
             Vec<String>,
@@ -733,8 +718,10 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             dec_cache.insert(c.clone(), d);
         }
 
-        let mut valid_targets: Vec<(String, String, usize)> = Vec::with_capacity(wallets_for_tron.len());
-        
+        let mut valid_targets: Vec<(String, String, usize)> = Vec::with_capacity(
+            wallets_for_tron.len()
+        );
+
         for w in &wallets_for_tron {
             if let Ok(row_idx) = row_index_lookup(w) {
                 let wallet_b58 = if derived_from_evm {
@@ -750,35 +737,46 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         }
 
         // Phase A: Native TRX (Concurrent)
-        let native_results = stream::iter(valid_targets.clone())
+        let native_results = stream
+            ::iter(valid_targets.clone())
             .map(|(_orig_w, wallet_b58, row_idx)| {
-                let tron_client = tron.clone(); 
+                let tron_client = tron.clone();
                 async move {
-                    let sun = tron_client.get_trx_balance_sun(&wallet_b58).await.unwrap_or_else(|e| {
-                         TRX_NET_FAIL.fetch_add(1, Ordering::Relaxed);
-                         tracing::error!(wallet=%wallet_b58, error=%e, "tron getaccount failed -> keeping zero");
-                         0u64
-                    });
+                    let sun = tron_client
+                        .get_trx_balance_sun(&wallet_b58).await
+                        .unwrap_or_else(|e| {
+                            TRX_NET_FAIL.fetch_add(1, Ordering::Relaxed);
+                            tracing::error!(wallet=%wallet_b58, error=%e, "tron getaccount failed -> keeping zero");
+                            0u64
+                        });
                     (row_idx, sun)
                 }
             })
             .buffer_unordered(TRON_CONCURRENCY_LIMIT)
-            .collect::<Vec<_>>()
-            .await;
+            .collect::<Vec<_>>().await;
 
         for (row_idx, sun) in native_results {
             trx_total_sun = trx_total_sun.saturating_add(sun as u128);
-            
+
             // ✅ FIX 2: remove * dereference
-            let data_arr = final_result.get_mut("data").and_then(|v| v.as_array_mut()).unwrap();
+            let data_arr = final_result
+                .get_mut("data")
+                .and_then(|v| v.as_array_mut())
+                .unwrap();
             let row = data_arr.get_mut(row_idx).unwrap(); // no *
-            let bal_obj = row.get_mut("balance").and_then(|v| v.as_object_mut()).unwrap();
-            
+            let bal_obj = row
+                .get_mut("balance")
+                .and_then(|v| v.as_object_mut())
+                .unwrap();
+
             if !bal_obj.contains_key("trx") {
                 bal_obj.insert("trx".to_string(), json!({}));
             }
-            let trx_obj = bal_obj.get_mut("trx").and_then(|v| v.as_object_mut()).unwrap();
-            
+            let trx_obj = bal_obj
+                .get_mut("trx")
+                .and_then(|v| v.as_object_mut())
+                .unwrap();
+
             trx_obj.insert("trx".to_string(), json!(sun_u128_to_trx_fixed_18(sun as u128)));
         }
 
@@ -790,21 +788,23 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             }
         }
 
-        let trc20_results = stream::iter(trc20_tasks)
+        let trc20_results = stream
+            ::iter(trc20_tasks)
             .map(|(wallet_b58, contract, _orig_w, row_idx)| {
-                let tron_client = tron.clone(); 
+                let tron_client = tron.clone();
                 async move {
-                    let amt = tron_client.get_trc20_balance(&contract, &wallet_b58).await.unwrap_or_else(|e| {
-                         TRX_NET_FAIL.fetch_add(1, Ordering::Relaxed);
-                         tracing::error!(wallet=%wallet_b58, contract=%contract, error=%e, "trc20 failed");
-                         0u128
-                    });
+                    let amt = tron_client
+                        .get_trc20_balance(&contract, &wallet_b58).await
+                        .unwrap_or_else(|e| {
+                            TRX_NET_FAIL.fetch_add(1, Ordering::Relaxed);
+                            tracing::error!(wallet=%wallet_b58, contract=%contract, error=%e, "trc20 failed");
+                            0u128
+                        });
                     (row_idx, contract, amt)
                 }
             })
             .buffer_unordered(TRON_CONCURRENCY_LIMIT)
-            .collect::<Vec<_>>()
-            .await;
+            .collect::<Vec<_>>().await;
 
         for (row_idx, contract, amt) in trc20_results {
             *trc20_totals.entry(contract.clone()).or_insert(0u128) += amt;
@@ -813,14 +813,23 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             let formatted = u128_base_units_to_fixed_18(amt, dec);
 
             // ✅ FIX 2: remove * dereference if present (though here row_idx was passed as usize, so it should be fine as just row_idx)
-            let data_arr = final_result.get_mut("data").and_then(|v| v.as_array_mut()).unwrap();
+            let data_arr = final_result
+                .get_mut("data")
+                .and_then(|v| v.as_array_mut())
+                .unwrap();
             let row = data_arr.get_mut(row_idx).unwrap();
-            let bal_obj = row.get_mut("balance").and_then(|v| v.as_object_mut()).unwrap();
-            
+            let bal_obj = row
+                .get_mut("balance")
+                .and_then(|v| v.as_object_mut())
+                .unwrap();
+
             if !bal_obj.contains_key("trx") {
                 bal_obj.insert("trx".to_string(), json!({}));
             }
-            let trx_obj = bal_obj.get_mut("trx").and_then(|v| v.as_object_mut()).unwrap();
+            let trx_obj = bal_obj
+                .get_mut("trx")
+                .and_then(|v| v.as_object_mut())
+                .unwrap();
             trx_obj.insert(contract, json!(formatted));
         }
 
@@ -837,13 +846,14 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                 totals_balance_obj.insert("trx".to_string(), json!({}));
             }
 
-            if let Some(trx_total_obj) = totals_balance_obj
-                .get_mut("trx")
-                .and_then(|v| v.as_object_mut())
+            if
+                let Some(trx_total_obj) = totals_balance_obj
+                    .get_mut("trx")
+                    .and_then(|v| v.as_object_mut())
             {
                 trx_total_obj.insert(
                     "trx".to_string(),
-                    json!(sun_u128_to_trx_fixed_18(trx_total_sun)),
+                    json!(sun_u128_to_trx_fixed_18(trx_total_sun))
                 );
 
                 for c in &tron_contracts {
@@ -866,6 +876,9 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         );
     }
 
+    // ✅ COMPARE CHANGE
+    let has_changed = final_result != initial_result_json;
+
     // Final Update
     snapshots.update_one(
         doc! { "requestKey": request_key },
@@ -873,6 +886,8 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                 "$set": {
                     "lastUpdatedAt": now,
                     "refreshState": "idle",
+                    "isComplete": true,
+                    "hasChanged": has_changed, // ✅ UPDATED
                     "result": bson::to_bson(&final_result).unwrap_or(bson::Bson::Null),
                     "normalizedRequest": bson::to_bson(&req_sanitized_json).unwrap_or(bson::Bson::Null)
                 }
@@ -884,9 +899,8 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
 
     jobs.update_one(
         doc! { "requestKey": request_key },
-        doc! { "$set": { "status": "done", "updatedAt": now } },
-    )
-    .await?;
+        doc! { "$set": { "status": "done", "updatedAt": now } }
+    ).await?;
 
     Ok(())
 }

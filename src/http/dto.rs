@@ -45,13 +45,19 @@ pub struct BalanceRequest {
 pub struct BalanceResponse {
     pub status: bool,
 
+    #[serde(rename = "isComplete")]
+    pub is_complete: bool,
+
+    #[serde(rename = "hasChanged")]
+    pub has_changed: bool,
+
     pub result: serde_json::Value,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ApiErrorBody>,
 }
 
-// Client asked for fixed 18-decimal zeros
+// fixed 18-decimal zeros
 const ZERO_18: &str = "0.000000000000000000";
 
 fn native_symbol_for(network: &str) -> &str {
