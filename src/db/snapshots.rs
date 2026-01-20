@@ -1,16 +1,28 @@
 // ==================================================
-// balance-service\src\db\snapshots.rs
+// FILE: D:\Learn\rust\balance-service\src\db\snapshots.rs
 // ==================================================
 
 use crate::db::models::BalanceSnapshotDoc;
 use bson::doc;
-use mongodb::Collection;
+use mongodb::{options::FindOneOptions, Collection};
+use serde::{Deserialize, Serialize};
+
+// ✅ Mini-struct for type-safe status checking
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SnapshotStatus {
+    #[serde(rename = "isComplete", default)]
+    pub is_complete: bool,
+    #[serde(rename = "hasChanged", default)]
+    pub has_changed: bool,
+    #[serde(rename = "requestKey")]
+    pub request_key: String,
+}
 
 pub fn snapshots_collection(db: &mongodb::Database) -> Collection<BalanceSnapshotDoc> {
     db.collection::<BalanceSnapshotDoc>("balance_snapshots")
 }
 
-/// Create unique index on requestKey once (call at startup in Phase 2+).
+/// Create unique index on requestKey once
 pub async fn ensure_indexes(db: &mongodb::Database) -> Result<(), mongodb::error::Error> {
     use mongodb::options::IndexOptions;
     use mongodb::IndexModel;
@@ -25,12 +37,36 @@ pub async fn ensure_indexes(db: &mongodb::Database) -> Result<(), mongodb::error
     Ok(())
 }
 
+/// ✅ Fetch ONLY status fields (Lightweight) using projection
+pub async fn get_snapshot_status(
+    db: &mongodb::Database,
+    request_key: &str,
+) -> Result<Option<SnapshotStatus>, mongodb::error::Error> {
+    // We use a raw document collection for the projection, then deserialize to our struct
+    let coll = db.collection::<SnapshotStatus>("balance_snapshots");
+    
+    let filter = doc! { "requestKey": request_key };
+    
+    let options = FindOneOptions::builder()
+        .projection(doc! { 
+            "isComplete": 1, 
+            "hasChanged": 1, 
+            "requestKey": 1,
+            "_id": 0 
+        })
+        .build();
+
+    // ✅ FIXED: Chained .with_options() correctly
+    coll.find_one(filter).with_options(options).await
+}
+
 pub async fn get_snapshot(
     db: &mongodb::Database,
     request_key: &str,
 ) -> Result<Option<BalanceSnapshotDoc>, mongodb::error::Error> {
     let coll = snapshots_collection(db);
     let filter = doc! { "requestKey": request_key };
+    // ✅ FIXED: Removed unnecessary 'None' argument
     coll.find_one(filter).await
 }
 
@@ -55,7 +91,7 @@ pub async fn upsert_empty_snapshot(
             "lastUpdatedAt": now,
             "refreshState": "idle",
             "isComplete": false,
-            "hasChanged": true 
+            "hasChanged": false 
         }
     };
 
@@ -64,7 +100,6 @@ pub async fn upsert_empty_snapshot(
     Ok(())
 }
 
-/// Keeps snapshot state consistent
 pub async fn set_refresh_state(
     db: &mongodb::Database,
     request_key: &str,

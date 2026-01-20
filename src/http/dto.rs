@@ -1,5 +1,5 @@
 // ==================================================
-// balance-service\src\http\dto.rs
+// FILE: D:\Learn\rust\balance-service\src\http\dto.rs
 // ==================================================
 
 use serde::{Deserialize, Serialize};
@@ -50,6 +50,10 @@ pub struct BalanceResponse {
 
     #[serde(rename = "hasChanged")]
     pub has_changed: bool,
+
+    // ✅ FIXED: Added this missing field
+    #[serde(rename = "requestKey")]
+    pub request_key: String,
 
     pub result: serde_json::Value,
 

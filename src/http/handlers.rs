@@ -9,7 +9,12 @@ use crate::http::dto::{zero_result_from_request, BalanceRequest, BalanceResponse
 use crate::http::validate::{validate_normalized_request, validate_request_limits};
 use crate::AppState;
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
 use bson::DateTime;
 use serde_json::json;
 
@@ -22,11 +27,38 @@ pub async fn health() -> &'static str {
     "ok"
 }
 
+// ✅ Lightweight status check for Node.js poller
+pub async fn get_job_status(
+    State(state): State<AppState>,
+    Path(request_key): Path<String>,
+) -> impl IntoResponse {
+    match snapshots::get_snapshot_status(&state.mongo.db, &request_key).await {
+        Ok(Some(status)) => Json(json!({
+            "status": true,
+            "isComplete": status.is_complete,
+            "hasChanged": status.has_changed,
+            "requestKey": status.request_key
+        }))
+        .into_response(),
+        Ok(None) => Json(json!({
+            "status": false,
+            "message": "Job not found",
+            "isComplete": false,
+            "hasChanged": false
+        }))
+        .into_response(),
+        Err(e) => {
+            tracing::error!("Status check error: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 pub async fn get_multi_wallet_balances(
     State(state): State<AppState>,
     Json(req): Json<BalanceRequest>,
 ) -> impl IntoResponse {
-    // 1) Validate raw limits first (cheap anti-abuse)
+    // 1) Validate raw limits first
     if let Err(e) = validate_request_limits(&req) {
         return e.into_response();
     }
@@ -34,7 +66,7 @@ pub async fn get_multi_wallet_balances(
     // 2) Normalize
     let normalized = normalize_request(&req);
 
-    // 3) Validate normalized request (addresses, networks, work units)
+    // 3) Validate normalized request
     if let Err(e) = validate_normalized_request(&normalized) {
         return e.into_response();
     }
@@ -45,15 +77,6 @@ pub async fn get_multi_wallet_balances(
     tracing::info!(
         request_key = %request_key,
         hard_refresh = normalized.hard_refresh,
-        evm_wallets = normalized.wallet_addresses.len(),
-        sol_wallets = normalized.solana_wallet_addresses.len(),
-        tron_wallets = normalized.tron_wallet_addresses.len(),
-        doge_wallets = normalized.doge_wallet_addresses.len(),
-        btc_wallets = normalized.btc_wallet_addresses.len(),
-        contracts = ?normalized.contracts
-            .iter()
-            .map(|c| (&c.network_name, c.contract_addresses.len()))
-            .collect::<Vec<_>>(),
         "balances request received"
     );
 
@@ -61,56 +84,39 @@ pub async fn get_multi_wallet_balances(
 
     match snapshots::get_snapshot(&state.mongo.db, &request_key).await {
         Ok(Some(doc)) => {
-            let age_secs = (now.timestamp_millis() - doc.last_updated_at.timestamp_millis()) / 1000;
+            let age_secs =
+                (now.timestamp_millis() - doc.last_updated_at.timestamp_millis()) / 1000;
             let is_stale = age_secs > STALE_AFTER_SECS;
+
+            // ✅ CRITICAL FIX: Cooldown applies to implicit stale refresh too
+            let in_cooldown = age_secs < HARD_REFRESH_COOLDOWN_SECS;
+            let should_refresh = (is_stale || normalized.hard_refresh) && !in_cooldown;
 
             tracing::debug!(
                 request_key = %request_key,
                 age_secs = age_secs,
                 is_stale = is_stale,
-                refresh_state = %doc.refresh_state,
-                is_complete = doc.is_complete,
+                should_refresh = should_refresh,
                 "snapshot hit"
             );
 
-            // Hard refresh cooldown to prevent spam
-            let hard_refresh_allowed = if normalized.hard_refresh {
-                age_secs >= HARD_REFRESH_COOLDOWN_SECS
-            } else {
-                true
-            };
-
-            if (is_stale || normalized.hard_refresh) && hard_refresh_allowed {
-                match refresh_jobs::enqueue_or_requeue(&state.mongo.db, &request_key).await {
-                    Ok(did_queue) => {
-                        tracing::info!(
-                            request_key = %request_key,
-                            did_queue = did_queue,
-                            "refresh job enqueue_or_requeue result"
-                        );
-
-                        if did_queue {
-                            let _ = snapshots::set_refresh_state(
-                                &state.mongo.db,
-                                &request_key,
-                                "queued",
-                            )
-                            .await;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            request_key=%request_key,
-                            error=%e,
-                            "failed to enqueue refresh job"
-                        );
+            if should_refresh {
+                // Try to enqueue. Note: enqueue_or_requeue dedups automatically.
+                if let Ok(did_queue) =
+                    refresh_jobs::enqueue_or_requeue(&state.mongo.db, &request_key).await
+                {
+                    if did_queue {
+                        let _ = snapshots::set_refresh_state(
+                            &state.mongo.db,
+                            &request_key,
+                            "queued",
+                        )
+                        .await;
                     }
                 }
-            } else if normalized.hard_refresh && !hard_refresh_allowed {
+            } else if normalized.hard_refresh && in_cooldown {
                 tracing::debug!(
                     request_key = %request_key,
-                    age_secs = age_secs,
-                    cooldown_secs = HARD_REFRESH_COOLDOWN_SECS,
                     "hard_refresh skipped due to cooldown"
                 );
             }
@@ -118,7 +124,8 @@ pub async fn get_multi_wallet_balances(
             Json(BalanceResponse {
                 status: true,
                 is_complete: doc.is_complete,
-                has_changed: doc.has_changed, // ✅ NEW: Return from DB
+                has_changed: doc.has_changed,
+                request_key: request_key.clone(),
                 result: doc.result,
                 error: None,
             })
@@ -134,46 +141,29 @@ pub async fn get_multi_wallet_balances(
             let normalized_json = serde_json::to_value(&normalized).unwrap_or(json!({}));
             let zero_result = zero_result_from_request(&normalized);
 
-            if let Err(e) = snapshots::upsert_empty_snapshot(
+            // Upsert empty snapshot (hasChanged = false)
+            let _ = snapshots::upsert_empty_snapshot(
                 &state.mongo.db,
                 &request_key,
                 normalized_json,
                 zero_result.clone(),
             )
-            .await
+            .await;
+
+            if let Ok(did_queue) =
+                refresh_jobs::enqueue_or_requeue(&state.mongo.db, &request_key).await
             {
-                tracing::error!(
-                    request_key=%request_key,
-                    error=%e,
-                    "failed to upsert zero snapshot"
-                );
-            }
-
-            match refresh_jobs::enqueue_or_requeue(&state.mongo.db, &request_key).await {
-                Ok(did_queue) => {
-                    tracing::info!(
-                        request_key=%request_key,
-                        did_queue=did_queue,
-                        "refresh job enqueue_or_requeue result"
-                    );
-
-                    if did_queue {
-                        let _ =
-                            snapshots::set_refresh_state(&state.mongo.db, &request_key, "queued")
-                                .await;
-                    }
+                if did_queue {
+                    let _ =
+                        snapshots::set_refresh_state(&state.mongo.db, &request_key, "queued").await;
                 }
-                Err(e) => tracing::error!(
-                    request_key=%request_key,
-                    error=%e,
-                    "failed to enqueue refresh job"
-                ),
             }
 
             Json(BalanceResponse {
                 status: true,
                 is_complete: false,
-                has_changed: true, // ✅ NEW: Fresh creation is a "change"
+                has_changed: false, // Default false on miss to avoid spam
+                request_key: request_key.clone(),
                 result: zero_result,
                 error: None,
             })
@@ -192,34 +182,12 @@ pub async fn get_multi_wallet_balances(
             Json(BalanceResponse {
                 status: true,
                 is_complete: false,
-                has_changed: false, // ✅ NEW
+                has_changed: false,
+                request_key: request_key.clone(),
                 result: zero_result,
                 error: None,
             })
             .into_response()
         }
     }
-}
-
-/// OPTIONAL: If you ever want to return errors explicitly from inside this handler:
-#[allow(dead_code)]
-fn bad_request(
-    code: &str,
-    message: &str,
-    details: serde_json::Value,
-) -> (StatusCode, Json<BalanceResponse>) {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(BalanceResponse {
-            status: false,
-            is_complete: false,
-            has_changed: false, // ✅ NEW
-            result: json!({}),
-            error: Some(crate::http::error::ApiErrorBody {
-                code: code.to_string(),
-                message: message.to_string(),
-                details: Some(details),
-            }),
-        }),
-    )
 }

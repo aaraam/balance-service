@@ -54,6 +54,10 @@ async fn main() -> Result<(), anyhow::Error> {
             "/wallet/get-multi-wallet-balances",
             post(http::handlers::get_multi_wallet_balances),
         )
+        .route(
+            "/wallet/status/:request_key",
+            get(http::handlers::get_job_status),
+        )
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;

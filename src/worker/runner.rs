@@ -1,5 +1,5 @@
 // ==================================================
-// balance-service\src\worker\runner.rs
+// FILE: D:\Learn\rust\balance-service\src\worker\runner.rs
 // ==================================================
 
 use crate::AppState;
@@ -227,12 +227,14 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
     // Mark snapshot running
     snapshots.update_one(
         doc! { "requestKey": request_key },
-        doc! { "$set": { "refreshState": "running", "isComplete": false } }
+        doc! { "$set": { "refreshState": "running", "isComplete": false } },
     ).await?;
 
     // Load snapshot doc
+    // ✅ FIXED: Removed 'None' argument
     let snap = snapshots
-        .find_one(doc! { "requestKey": request_key }).await?
+        .find_one(doc! { "requestKey": request_key })
+        .await?
         .ok_or_else(|| anyhow!("snapshot not found for requestKey"))?;
 
     // ✅ CAPTURE INITIAL STATE FOR CHANGE DETECTION
@@ -462,15 +464,14 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         }
     }
 
+    // ✅ FIXED: Don't write 'result' during partial updates, only timestamp/heartbeat
     snapshots.update_one(
         doc! { "requestKey": request_key },
         doc! {
                 "$set": {
                     "lastUpdatedAt": DateTime::now(),
                     "refreshState": "running",
-                    "isComplete": false,
-                    "result": bson::to_bson(&final_result).unwrap_or(bson::Bson::Null),
-                    "normalizedRequest": bson::to_bson(&req_sanitized_json).unwrap_or(bson::Bson::Null)
+                    "isComplete": false
                 }
             }
     ).await?;
@@ -635,16 +636,14 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             "sol network processed"
         );
 
-        // ✅ INCREMENTAL UPDATE #2: SOLANA DONE
+        // ✅ FIXED: Don't write 'result' during partial updates
         snapshots.update_one(
             doc! { "requestKey": request_key },
             doc! {
                     "$set": {
                         "lastUpdatedAt": DateTime::now(),
                         "refreshState": "running",
-                        "isComplete": false,
-                        "result": bson::to_bson(&final_result).unwrap_or(bson::Bson::Null),
-                        "normalizedRequest": bson::to_bson(&req_sanitized_json).unwrap_or(bson::Bson::Null)
+                        "isComplete": false
                     }
                 }
         ).await?;
@@ -909,6 +908,7 @@ async fn mark_job_failed(state: &AppState, request_key: &str) -> Result<(), mong
     let jobs = state.mongo.db.collection::<bson::Document>("balance_refresh_jobs");
     let now = DateTime::now();
 
+    // ✅ FIXED: Removed 'None' argument
     let job = jobs.find_one(doc! { "requestKey": request_key }).await?;
     let attempts =
         job
