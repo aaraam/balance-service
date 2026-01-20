@@ -1,3 +1,7 @@
+// ==================================================
+// balance-service\src\http\handlers.rs
+// ==================================================
+
 use crate::core::key::request_key_from_canonical_json;
 use crate::core::normalize::normalize_request;
 use crate::db::{refresh_jobs, snapshots};
@@ -65,6 +69,7 @@ pub async fn get_multi_wallet_balances(
                 age_secs = age_secs,
                 is_stale = is_stale,
                 refresh_state = %doc.refresh_state,
+                is_complete = doc.is_complete,
                 "snapshot hit"
             );
 
@@ -112,6 +117,8 @@ pub async fn get_multi_wallet_balances(
 
             Json(BalanceResponse {
                 status: true,
+                is_complete: doc.is_complete,
+                has_changed: doc.has_changed, // ✅ NEW: Return from DB
                 result: doc.result,
                 error: None,
             })
@@ -165,6 +172,8 @@ pub async fn get_multi_wallet_balances(
 
             Json(BalanceResponse {
                 status: true,
+                is_complete: false,
+                has_changed: true, // ✅ NEW: Fresh creation is a "change"
                 result: zero_result,
                 error: None,
             })
@@ -178,12 +187,12 @@ pub async fn get_multi_wallet_balances(
                 "snapshot fetch error (fail-soft)"
             );
 
-            // Still return standard-shaped zeros (but this is server-side issue)
             let zero_result = zero_result_from_request(&normalized);
 
-            // You *could* also include an error meta here, but per your current contract we keep status=true
             Json(BalanceResponse {
                 status: true,
+                is_complete: false,
+                has_changed: false, // ✅ NEW
                 result: zero_result,
                 error: None,
             })
@@ -203,6 +212,8 @@ fn bad_request(
         StatusCode::BAD_REQUEST,
         Json(BalanceResponse {
             status: false,
+            is_complete: false,
+            has_changed: false, // ✅ NEW
             result: json!({}),
             error: Some(crate::http::error::ApiErrorBody {
                 code: code.to_string(),

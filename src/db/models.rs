@@ -1,3 +1,7 @@
+// ==================================================
+// balance-service\src\db\models.rs
+// ==================================================
+
 use bson::DateTime;
 use serde::{Deserialize, Serialize};
 
@@ -9,6 +13,12 @@ pub struct BalanceSnapshotDoc {
     pub result: serde_json::Value,
     pub last_updated_at: DateTime,
     pub refresh_state: String,
+
+    #[serde(default)]
+    pub is_complete: bool,
+
+    #[serde(default)]
+    pub has_changed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -3,11 +3,11 @@
 // ==================================================
 
 use anyhow::anyhow;
+use base64::{engine::general_purpose, Engine as _};
 use ethabi::{Function, Param, ParamType, StateMutability, Token};
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::time::Duration;
-use base64::{engine::general_purpose, Engine as _};
 
 #[derive(Clone)]
 pub struct TronRpcClient {
@@ -195,7 +195,7 @@ impl TronRpcClient {
             } else {
                 clean_hex.to_string()
             };
-            
+
             if let Ok(bytes) = hex::decode(&hex_input) {
                 return Ok(bytes);
             }
@@ -206,10 +206,13 @@ impl TronRpcClient {
             Ok(bytes) => {
                 tracing::debug!(len = bytes.len(), "decoded constant_result via Base64");
                 Ok(bytes)
-            },
+            }
             Err(_) => {
                 // Return generic error if both fail
-                Err(anyhow!("constant_result is neither valid Hex nor Base64: {}", s))
+                Err(anyhow!(
+                    "constant_result is neither valid Hex nor Base64: {}",
+                    s
+                ))
             }
         }
     }
@@ -265,7 +268,11 @@ impl TronRpcClient {
         };
 
         // Fix: Use correct path segment to avoid 405 Method Not Allowed
-        let path_segment = if use_solidity { "walletsolidity" } else { "wallet" };
+        let path_segment = if use_solidity {
+            "walletsolidity"
+        } else {
+            "wallet"
+        };
         let url = format!("{}/{}/triggerconstantcontract", base_url, path_segment);
 
         let payload = json!({
@@ -359,12 +366,12 @@ impl TronRpcClient {
         // ethabi::Token::Address forces 20 bytes, stripping 0x41.
         // We need: [11 bytes padding] + [0x41] + [20 bytes address]
         // ---------------------------------------------------------
-        
+
         // 1. Get the 21-byte hex string (e.g., "41..." + 40 chars)
         let addr_hex_41 = Self::tron_base58_to_hex41(owner_b58)?;
 
-        // 2. Pad to 32 bytes (64 hex characters). 
-        //    21 bytes = 42 chars. 
+        // 2. Pad to 32 bytes (64 hex characters).
+        //    21 bytes = 42 chars.
         //    32 bytes = 64 chars.
         //    64 - 42 = 22 characters of zero padding needed.
         let param_hex = format!("{}{}", "0".repeat(22), addr_hex_41);

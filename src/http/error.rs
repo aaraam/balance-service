@@ -60,6 +60,8 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let payload = crate::http::dto::BalanceResponse {
             status: false,
+            is_complete: false,
+            has_changed: false, // ✅ NEW
             result: serde_json::json!({}),
             error: Some(self.body),
         };
