@@ -4,25 +4,23 @@
 
 use crate::AppState;
 use anyhow::anyhow;
-use bson::{ doc, DateTime };
-use futures::stream::{ self, StreamExt }; 
-use mongodb::options::{ FindOneAndUpdateOptions, ReturnDocument };
+use bson::{doc, DateTime};
+use futures::stream::{self, StreamExt};
+use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
 use serde_json::json;
 
-use crate::chains::{ is_ignored_network, supported_evm_networks };
+use crate::chains::{is_ignored_network, supported_evm_networks};
 use crate::core::normalize::normalize_request;
 use crate::evm::format::u256_to_decimal_string;
 use crate::evm::multicall3::{
-    fetch_balances_multicall3,
-    fetch_token_decimals_multicall3,
-    EvmBalances,
+    fetch_balances_multicall3, fetch_token_decimals_multicall3, EvmBalances,
 };
 use crate::evm::rpc::RpcClient;
-use crate::http::dto::{ zero_result_from_request, BalanceRequest };
+use crate::http::dto::{zero_result_from_request, BalanceRequest};
 use crate::solana::rpc::SolanaRpcClient;
 use crate::tron::rpc::TronRpcClient;
 
-use std::sync::atomic::{ AtomicU64, Ordering };
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 const MAX_CALLS_PER_BATCH: usize = 600;
@@ -68,7 +66,7 @@ fn native_symbol_for(network: &str) -> &str {
         "bnb" => "bnb",
         "matic" => "matic",
         "op" => "op",
-        _ => network, 
+        _ => network,
     }
 }
 
@@ -130,7 +128,11 @@ fn tron_contracts_from_request(req: &BalanceRequest) -> Vec<String> {
 pub async fn run_worker(state: AppState) {
     let poll_ms = state.cfg.worker_poll_ms;
 
-    tracing::info!(worker_enabled = state.cfg.worker_enabled, poll_ms = poll_ms, "worker started");
+    tracing::info!(
+        worker_enabled = state.cfg.worker_enabled,
+        poll_ms = poll_ms,
+        "worker started"
+    );
 
     loop {
         if !state.cfg.worker_enabled {
@@ -187,11 +189,13 @@ pub async fn run_worker(state: AppState) {
 }
 
 async fn claim_next_job(state: &AppState) -> Result<Option<String>, mongodb::error::Error> {
-    let coll = state.mongo.db.collection::<bson::Document>("balance_refresh_jobs");
+    let coll = state
+        .mongo
+        .db
+        .collection::<bson::Document>("balance_refresh_jobs");
     let now = DateTime::now();
 
-    let filter =
-        doc! {
+    let filter = doc! {
         "status": "queued",
         "$or": [
             { "nextRetryAt": bson::Bson::Null },
@@ -208,27 +212,28 @@ async fn claim_next_job(state: &AppState) -> Result<Option<String>, mongodb::err
         .return_document(ReturnDocument::After)
         .build();
 
-    let doc_opt = coll.find_one_and_update(filter, update).with_options(opts).await?;
+    let doc_opt = coll
+        .find_one_and_update(filter, update)
+        .with_options(opts)
+        .await?;
 
-    Ok(
-        doc_opt.and_then(|d|
-            d
-                .get_str("requestKey")
-                .ok()
-                .map(|s| s.to_string())
-        )
-    )
+    Ok(doc_opt.and_then(|d| d.get_str("requestKey").ok().map(|s| s.to_string())))
 }
 
 async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::Error> {
-    let snapshots = state.mongo.db.collection::<bson::Document>("balance_snapshots");
+    let snapshots = state
+        .mongo
+        .db
+        .collection::<bson::Document>("balance_snapshots");
     let now = DateTime::now();
 
     // Mark snapshot running
-    snapshots.update_one(
-        doc! { "requestKey": request_key },
-        doc! { "$set": { "refreshState": "running", "isComplete": false } },
-    ).await?;
+    snapshots
+        .update_one(
+            doc! { "requestKey": request_key },
+            doc! { "$set": { "refreshState": "running", "isComplete": false } },
+        )
+        .await?;
 
     // Load snapshot doc
     // ✅ FIXED: Removed 'None' argument
@@ -244,14 +249,15 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         .and_then(|b| bson::from_bson(b).ok())
         .unwrap_or(json!({}));
 
-    let normalized_req_bson = snap.get("normalizedRequest").cloned().unwrap_or(bson::Bson::Null);
+    let normalized_req_bson = snap
+        .get("normalizedRequest")
+        .cloned()
+        .unwrap_or(bson::Bson::Null);
 
-    let normalized_req_json: serde_json::Value = bson
-        ::from_bson(normalized_req_bson)
-        .unwrap_or_else(|_| json!({}));
+    let normalized_req_json: serde_json::Value =
+        bson::from_bson(normalized_req_bson).unwrap_or_else(|_| json!({}));
 
-    let req_raw: BalanceRequest = serde_json
-        ::from_value(normalized_req_json.clone())
+    let req_raw: BalanceRequest = serde_json::from_value(normalized_req_json.clone())
         .unwrap_or_else(|_| BalanceRequest {
             hard_refresh: false,
             contracts: vec![],
@@ -281,21 +287,24 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
     }
 
     // Row indices
-    let evm_wallet_index: std::collections::HashMap<String, usize> = req.wallet_addresses
+    let evm_wallet_index: std::collections::HashMap<String, usize> = req
+        .wallet_addresses
         .iter()
         .enumerate()
         .map(|(i, w)| (w.clone(), i))
         .collect();
 
     let sol_offset = req.wallet_addresses.len();
-    let sol_wallet_index: std::collections::HashMap<String, usize> = req.solana_wallet_addresses
+    let sol_wallet_index: std::collections::HashMap<String, usize> = req
+        .solana_wallet_addresses
         .iter()
         .enumerate()
         .map(|(i, w)| (w.clone(), sol_offset + i))
         .collect();
 
     let tron_offset = sol_offset + req.solana_wallet_addresses.len();
-    let tron_wallet_index: std::collections::HashMap<String, usize> = req.tron_wallet_addresses
+    let tron_wallet_index: std::collections::HashMap<String, usize> = req
+        .tron_wallet_addresses
         .iter()
         .enumerate()
         .map(|(i, w)| (w.clone(), tron_offset + i))
@@ -328,13 +337,13 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         let rpc_url = chain.thirdweb_rpc_url(&state.cfg.thirdweb_client_id);
         let rpc = RpcClient::new(rpc_url, state.cfg.rpc_timeout_ms);
 
-        let balances: EvmBalances = match
-            fetch_balances_multicall3(
-                &rpc,
-                &req.wallet_addresses,
-                &cg.contract_addresses,
-                MAX_CALLS_PER_BATCH
-            ).await
+        let balances: EvmBalances = match fetch_balances_multicall3(
+            &rpc,
+            &req.wallet_addresses,
+            &cg.contract_addresses,
+            MAX_CALLS_PER_BATCH,
+        )
+        .await
         {
             Ok(b) => b,
             Err(e) => {
@@ -351,8 +360,12 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             }
         };
 
-        let decimals_map = match
-            fetch_token_decimals_multicall3(&rpc, &cg.contract_addresses, MAX_CALLS_PER_BATCH).await
+        let decimals_map = match fetch_token_decimals_multicall3(
+            &rpc,
+            &cg.contract_addresses,
+            MAX_CALLS_PER_BATCH,
+        )
+        .await
         {
             Ok(m) => m,
             Err(e) => {
@@ -371,7 +384,9 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                 .and_then(|v| v.as_array_mut())
                 .ok_or_else(|| anyhow!("final_result.data missing or not array"))?;
 
-            let row = data_arr.get_mut(row_idx).ok_or_else(|| anyhow!("wallet row missing"))?;
+            let row = data_arr
+                .get_mut(row_idx)
+                .ok_or_else(|| anyhow!("wallet row missing"))?;
 
             let bal_obj = row
                 .get_mut("balance")
@@ -391,7 +406,8 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             chain_obj.insert(native_symbol_for(net).to_string(), json!(native_str));
 
             for token_addr in &cg.contract_addresses {
-                let raw_bal = balances.erc20
+                let raw_bal = balances
+                    .erc20
                     .get(w)
                     .and_then(|m| m.get(token_addr))
                     .cloned()
@@ -428,14 +444,15 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
 
         total_chain_obj.insert(
             native_symbol_for(net).to_string(),
-            json!(u256_to_decimal_string(native_sum, NATIVE_DECIMALS, false))
+            json!(u256_to_decimal_string(native_sum, NATIVE_DECIMALS, false)),
         );
 
         for token_addr in &cg.contract_addresses {
             let mut sum = ethereum_types::U256::zero();
 
             for w in &req.wallet_addresses {
-                let v = balances.erc20
+                let v = balances
+                    .erc20
                     .get(w)
                     .and_then(|m| m.get(token_addr))
                     .cloned()
@@ -446,7 +463,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             let dec = decimals_map.get(token_addr).cloned().unwrap_or(18);
             total_chain_obj.insert(
                 token_addr.clone(),
-                json!(u256_to_decimal_string(sum, dec, false))
+                json!(u256_to_decimal_string(sum, dec, false)),
             );
         }
 
@@ -465,16 +482,18 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
     }
 
     // ✅ FIXED: Don't write 'result' during partial updates, only timestamp/heartbeat
-    snapshots.update_one(
-        doc! { "requestKey": request_key },
-        doc! {
+    snapshots
+        .update_one(
+            doc! { "requestKey": request_key },
+            doc! {
                 "$set": {
                     "lastUpdatedAt": DateTime::now(),
                     "refreshState": "running",
                     "isComplete": false
                 }
-            }
-    ).await?;
+            },
+        )
+        .await?;
     tracing::debug!(request_key = %request_key, "incremental DB update (EVM done)");
 
     // ==========================
@@ -482,22 +501,16 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
     // ==========================
     if !req.solana_wallet_addresses.is_empty() {
         let sol_start = Instant::now();
-        let sol_rpc = SolanaRpcClient::new(
-            state.cfg.solana_rpc_url.clone(),
-            state.cfg.rpc_timeout_ms
-        );
+        let sol_rpc =
+            SolanaRpcClient::new(state.cfg.solana_rpc_url.clone(), state.cfg.rpc_timeout_ms);
 
         let sol_mints = sol_mints_from_request(&req);
 
         let mut sol_total_lamports: u128 = 0;
-        let mut spl_totals: std::collections::HashMap<
-            String,
-            u128
-        > = std::collections::HashMap::new();
-        let mut spl_decimals: std::collections::HashMap<
-            String,
-            u32
-        > = std::collections::HashMap::new();
+        let mut spl_totals: std::collections::HashMap<String, u128> =
+            std::collections::HashMap::new();
+        let mut spl_decimals: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
 
         for w in &req.solana_wallet_addresses {
             let row_idx = *sol_wallet_index
@@ -518,7 +531,9 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                     .and_then(|v| v.as_array_mut())
                     .ok_or_else(|| anyhow!("final_result.data missing or not array"))?;
 
-                let row = data_arr.get_mut(row_idx).ok_or_else(|| anyhow!("wallet row missing"))?;
+                let row = data_arr
+                    .get_mut(row_idx)
+                    .ok_or_else(|| anyhow!("wallet row missing"))?;
 
                 let bal_obj = row
                     .get_mut("balance")
@@ -535,7 +550,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
 
                 sol_obj.insert(
                     "sol".to_string(),
-                    json!(lamports_u128_to_sol_fixed_18(lamports as u128))
+                    json!(lamports_u128_to_sol_fixed_18(lamports as u128)),
                 );
             }
 
@@ -546,7 +561,8 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                 }
 
                 let (amt_u128, dec_u32) = sol_rpc
-                    .get_spl_balance_by_owner_mint(w, mint).await
+                    .get_spl_balance_by_owner_mint(w, mint)
+                    .await
                     .unwrap_or_else(|e| {
                         SOL_NET_FAIL.fetch_add(1, Ordering::Relaxed);
                         tracing::error!(
@@ -576,7 +592,9 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                     .get_mut("data")
                     .and_then(|v| v.as_array_mut())
                     .ok_or_else(|| anyhow!("final_result.data missing or not array"))?;
-                let row = data_arr.get_mut(row_idx).ok_or_else(|| anyhow!("wallet row missing"))?;
+                let row = data_arr
+                    .get_mut(row_idx)
+                    .ok_or_else(|| anyhow!("wallet row missing"))?;
                 let bal_obj = row
                     .get_mut("balance")
                     .and_then(|v| v.as_object_mut())
@@ -605,23 +623,20 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             if !totals_balance_obj.contains_key("sol") {
                 totals_balance_obj.insert("sol".to_string(), json!({}));
             }
-            if
-                let Some(sol_total_obj) = totals_balance_obj
-                    .get_mut("sol")
-                    .and_then(|v| v.as_object_mut())
+            if let Some(sol_total_obj) = totals_balance_obj
+                .get_mut("sol")
+                .and_then(|v| v.as_object_mut())
             {
                 sol_total_obj.insert(
                     "sol".to_string(),
-                    json!(lamports_u128_to_sol_fixed_18(sol_total_lamports))
+                    json!(lamports_u128_to_sol_fixed_18(sol_total_lamports)),
                 );
 
                 for mint in &sol_mints {
                     let sum = spl_totals.get(mint).cloned().unwrap_or(0u128);
                     let dec = spl_decimals.get(mint).cloned().unwrap_or(0u32);
-                    sol_total_obj.insert(
-                        mint.clone(),
-                        json!(u128_base_units_to_fixed_18(sum, dec))
-                    );
+                    sol_total_obj
+                        .insert(mint.clone(), json!(u128_base_units_to_fixed_18(sum, dec)));
                 }
             }
         }
@@ -637,16 +652,18 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         );
 
         // ✅ FIXED: Don't write 'result' during partial updates
-        snapshots.update_one(
-            doc! { "requestKey": request_key },
-            doc! {
+        snapshots
+            .update_one(
+                doc! { "requestKey": request_key },
+                doc! {
                     "$set": {
                         "lastUpdatedAt": DateTime::now(),
                         "refreshState": "running",
                         "isComplete": false
                     }
-                }
-        ).await?;
+                },
+            )
+            .await?;
         tracing::debug!(request_key = %request_key, "incremental DB update (Solana done)");
     }
 
@@ -656,9 +673,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
     let tron_contracts = tron_contracts_from_request(&req);
     let tron_requested = !req.tron_wallet_addresses.is_empty() || !tron_contracts.is_empty();
 
-    if
-        tron_requested &&
-        (!req.tron_wallet_addresses.is_empty() || !req.wallet_addresses.is_empty())
+    if tron_requested && (!req.tron_wallet_addresses.is_empty() || !req.wallet_addresses.is_empty())
     {
         let trx_start = Instant::now();
 
@@ -666,19 +681,15 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             state.cfg.tron_fullnode_url.clone(),
             state.cfg.tron_solidity_url.clone(),
             state.cfg.tron_api_key.clone(),
-            state.cfg.rpc_timeout_ms
+            state.cfg.rpc_timeout_ms,
         );
 
-        let mut dec_cache: std::collections::HashMap<
-            String,
-            u32
-        > = std::collections::HashMap::new();
+        let mut dec_cache: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
 
         let mut trx_total_sun: u128 = 0;
-        let mut trc20_totals: std::collections::HashMap<
-            String,
-            u128
-        > = std::collections::HashMap::new();
+        let mut trc20_totals: std::collections::HashMap<String, u128> =
+            std::collections::HashMap::new();
 
         let (wallets_for_tron, row_index_lookup, derived_from_evm): (
             Vec<String>,
@@ -717,9 +728,8 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             dec_cache.insert(c.clone(), d);
         }
 
-        let mut valid_targets: Vec<(String, String, usize)> = Vec::with_capacity(
-            wallets_for_tron.len()
-        );
+        let mut valid_targets: Vec<(String, String, usize)> =
+            Vec::with_capacity(wallets_for_tron.len());
 
         for w in &wallets_for_tron {
             if let Ok(row_idx) = row_index_lookup(w) {
@@ -776,7 +786,10 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                 .and_then(|v| v.as_object_mut())
                 .unwrap();
 
-            trx_obj.insert("trx".to_string(), json!(sun_u128_to_trx_fixed_18(sun as u128)));
+            trx_obj.insert(
+                "trx".to_string(),
+                json!(sun_u128_to_trx_fixed_18(sun as u128)),
+            );
         }
 
         // Phase B: TRC20 Calls (Concurrent)
@@ -845,14 +858,13 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                 totals_balance_obj.insert("trx".to_string(), json!({}));
             }
 
-            if
-                let Some(trx_total_obj) = totals_balance_obj
-                    .get_mut("trx")
-                    .and_then(|v| v.as_object_mut())
+            if let Some(trx_total_obj) = totals_balance_obj
+                .get_mut("trx")
+                .and_then(|v| v.as_object_mut())
             {
                 trx_total_obj.insert(
                     "trx".to_string(),
-                    json!(sun_u128_to_trx_fixed_18(trx_total_sun))
+                    json!(sun_u128_to_trx_fixed_18(trx_total_sun)),
                 );
 
                 for c in &tron_contracts {
@@ -894,27 +906,34 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
     ).await?;
 
     // Mark job done
-    let jobs = state.mongo.db.collection::<bson::Document>("balance_refresh_jobs");
+    let jobs = state
+        .mongo
+        .db
+        .collection::<bson::Document>("balance_refresh_jobs");
 
     jobs.update_one(
         doc! { "requestKey": request_key },
-        doc! { "$set": { "status": "done", "updatedAt": now } }
-    ).await?;
+        doc! { "$set": { "status": "done", "updatedAt": now } },
+    )
+    .await?;
 
     Ok(())
 }
 
 async fn mark_job_failed(state: &AppState, request_key: &str) -> Result<(), mongodb::error::Error> {
-    let jobs = state.mongo.db.collection::<bson::Document>("balance_refresh_jobs");
+    let jobs = state
+        .mongo
+        .db
+        .collection::<bson::Document>("balance_refresh_jobs");
     let now = DateTime::now();
 
     // ✅ FIXED: Removed 'None' argument
     let job = jobs.find_one(doc! { "requestKey": request_key }).await?;
-    let attempts =
-        job
-            .as_ref()
-            .and_then(|d| d.get_i32("attempts").ok())
-            .unwrap_or(0) + 1;
+    let attempts = job
+        .as_ref()
+        .and_then(|d| d.get_i32("attempts").ok())
+        .unwrap_or(0)
+        + 1;
 
     let backoff_secs = (attempts as i64) * 5;
     let next_retry_ms = now.timestamp_millis() + backoff_secs * 1000;
@@ -930,8 +949,9 @@ async fn mark_job_failed(state: &AppState, request_key: &str) -> Result<(), mong
             },
             "$setOnInsert": { "createdAt": now },
             "$inc": { "attempts": 1 }
-        }
-    ).await?;
+        },
+    )
+    .await?;
 
     Ok(())
 }

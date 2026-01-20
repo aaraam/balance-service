@@ -36,7 +36,9 @@ pub enum ConfigError {
 
 impl AppConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
-        let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+        let bind_addr = std::env::var("BIND_ADDR")
+            .or_else(|_| std::env::var("BIND_ADDRESS"))
+            .unwrap_or_else(|_| "[::]:3459".to_string());
 
         let mongodb_uri =
             std::env::var("MONGODB_URI").map_err(|_| ConfigError::MissingEnv("MONGODB_URI"))?;

@@ -63,7 +63,7 @@ impl IntoResponse for ApiError {
             is_complete: false,
             has_changed: false,
             // ✅ FIXED: Field added
-            request_key: "".to_string(), 
+            request_key: "".to_string(),
             result: serde_json::json!({}),
             error: Some(self.body),
         };

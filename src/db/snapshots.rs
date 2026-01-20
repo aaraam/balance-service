@@ -44,15 +44,15 @@ pub async fn get_snapshot_status(
 ) -> Result<Option<SnapshotStatus>, mongodb::error::Error> {
     // We use a raw document collection for the projection, then deserialize to our struct
     let coll = db.collection::<SnapshotStatus>("balance_snapshots");
-    
+
     let filter = doc! { "requestKey": request_key };
-    
+
     let options = FindOneOptions::builder()
-        .projection(doc! { 
-            "isComplete": 1, 
-            "hasChanged": 1, 
+        .projection(doc! {
+            "isComplete": 1,
+            "hasChanged": 1,
             "requestKey": 1,
-            "_id": 0 
+            "_id": 0
         })
         .build();
 
@@ -91,7 +91,7 @@ pub async fn upsert_empty_snapshot(
             "lastUpdatedAt": now,
             "refreshState": "idle",
             "isComplete": false,
-            "hasChanged": false 
+            "hasChanged": false
         }
     };
 

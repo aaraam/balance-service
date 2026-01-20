@@ -84,8 +84,7 @@ pub async fn get_multi_wallet_balances(
 
     match snapshots::get_snapshot(&state.mongo.db, &request_key).await {
         Ok(Some(doc)) => {
-            let age_secs =
-                (now.timestamp_millis() - doc.last_updated_at.timestamp_millis()) / 1000;
+            let age_secs = (now.timestamp_millis() - doc.last_updated_at.timestamp_millis()) / 1000;
             let is_stale = age_secs > STALE_AFTER_SECS;
 
             // ✅ CRITICAL FIX: Cooldown applies to implicit stale refresh too
@@ -106,12 +105,9 @@ pub async fn get_multi_wallet_balances(
                     refresh_jobs::enqueue_or_requeue(&state.mongo.db, &request_key).await
                 {
                     if did_queue {
-                        let _ = snapshots::set_refresh_state(
-                            &state.mongo.db,
-                            &request_key,
-                            "queued",
-                        )
-                        .await;
+                        let _ =
+                            snapshots::set_refresh_state(&state.mongo.db, &request_key, "queued")
+                                .await;
                     }
                 }
             } else if normalized.hard_refresh && in_cooldown {
