@@ -1,5 +1,5 @@
 // ==================================================
-// FILE: D:\Learn\rust\balance-service\src\worker\runner.rs
+// src\worker\runner.rs
 // ==================================================
 
 use crate::AppState;
@@ -8,6 +8,7 @@ use bson::{doc, DateTime};
 use futures::stream::{self, StreamExt};
 use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
 use serde_json::json;
+use tokio::time::{sleep, Duration}; // ✅ Added for rate limiting
 
 use crate::chains::{is_ignored_network, supported_evm_networks};
 use crate::core::normalize::normalize_request;
@@ -25,8 +26,8 @@ use std::time::Instant;
 
 const MAX_CALLS_PER_BATCH: usize = 600;
 
-/// Limits concurrent HTTP requests to Tron to avoid hitting API rate limits.
-const TRON_CONCURRENCY_LIMIT: usize = 5;
+/// ✅ FIXED: Reduced concurrency to 1 to match Node.js serial behavior and avoid 429s.
+const TRON_CONCURRENCY_LIMIT: usize = 1;
 
 const NATIVE_DECIMALS: u32 = 18;
 const SOL_DECIMALS: u32 = 9;
@@ -236,7 +237,6 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         .await?;
 
     // Load snapshot doc
-    // ✅ FIXED: Removed 'None' argument
     let snap = snapshots
         .find_one(doc! { "requestKey": request_key })
         .await?
@@ -481,7 +481,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         }
     }
 
-    // ✅ FIXED: Don't write 'result' during partial updates, only timestamp/heartbeat
+    // Incremental Update (Heartbeat)
     snapshots
         .update_one(
             doc! { "requestKey": request_key },
@@ -651,7 +651,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             "sol network processed"
         );
 
-        // ✅ FIXED: Don't write 'result' during partial updates
+        // Incremental Update
         snapshots
             .update_one(
                 doc! { "requestKey": request_key },
@@ -668,7 +668,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
     }
 
     // ==========================
-    // TRON processing
+    // TRON processing (Rate-Limited)
     // ==========================
     let tron_contracts = tron_contracts_from_request(&req);
     let tron_requested = !req.tron_wallet_addresses.is_empty() || !tron_contracts.is_empty();
@@ -745,12 +745,15 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             }
         }
 
-        // Phase A: Native TRX (Concurrent)
+        // Phase A: Native TRX (Throttled)
         let native_results = stream
             ::iter(valid_targets.clone())
             .map(|(_orig_w, wallet_b58, row_idx)| {
                 let tron_client = tron.clone();
                 async move {
+                    // ✅ RATE LIMIT PATCH: Slow down individual requests
+                    sleep(Duration::from_millis(200)).await;
+
                     let sun = tron_client
                         .get_trx_balance_sun(&wallet_b58).await
                         .unwrap_or_else(|e| {
@@ -761,18 +764,18 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                     (row_idx, sun)
                 }
             })
+            // ✅ CONCURRENCY LIMIT APPLIED HERE
             .buffer_unordered(TRON_CONCURRENCY_LIMIT)
             .collect::<Vec<_>>().await;
 
         for (row_idx, sun) in native_results {
             trx_total_sun = trx_total_sun.saturating_add(sun as u128);
 
-            // ✅ FIX 2: remove * dereference
             let data_arr = final_result
                 .get_mut("data")
                 .and_then(|v| v.as_array_mut())
                 .unwrap();
-            let row = data_arr.get_mut(row_idx).unwrap(); // no *
+            let row = data_arr.get_mut(row_idx).unwrap();
             let bal_obj = row
                 .get_mut("balance")
                 .and_then(|v| v.as_object_mut())
@@ -792,7 +795,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             );
         }
 
-        // Phase B: TRC20 Calls (Concurrent)
+        // Phase B: TRC20 Calls (Throttled)
         let mut trc20_tasks = Vec::new();
         for (orig_w, wallet_b58, row_idx) in &valid_targets {
             for c in &tron_contracts {
@@ -805,6 +808,9 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             .map(|(wallet_b58, contract, _orig_w, row_idx)| {
                 let tron_client = tron.clone();
                 async move {
+                    // ✅ RATE LIMIT PATCH: Slow down triggerconstantcontract calls
+                    sleep(Duration::from_millis(200)).await;
+
                     let amt = tron_client
                         .get_trc20_balance(&contract, &wallet_b58).await
                         .unwrap_or_else(|e| {
@@ -815,6 +821,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                     (row_idx, contract, amt)
                 }
             })
+            // ✅ CONCURRENCY LIMIT APPLIED HERE
             .buffer_unordered(TRON_CONCURRENCY_LIMIT)
             .collect::<Vec<_>>().await;
 
@@ -824,7 +831,6 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             let dec = dec_cache.get(&contract).cloned().unwrap_or(18u32);
             let formatted = u128_base_units_to_fixed_18(amt, dec);
 
-            // ✅ FIX 2: remove * dereference if present (though here row_idx was passed as usize, so it should be fine as just row_idx)
             let data_arr = final_result
                 .get_mut("data")
                 .and_then(|v| v.as_array_mut())
@@ -883,7 +889,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             contracts = tron_contracts.len(),
             wallets = wallets_for_tron.len(),
             derived_from_evm = derived_from_evm,
-            "tron network processed (parallel)"
+            "tron network processed (throttled)"
         );
     }
 
@@ -927,7 +933,6 @@ async fn mark_job_failed(state: &AppState, request_key: &str) -> Result<(), mong
         .collection::<bson::Document>("balance_refresh_jobs");
     let now = DateTime::now();
 
-    // ✅ FIXED: Removed 'None' argument
     let job = jobs.find_one(doc! { "requestKey": request_key }).await?;
     let attempts = job
         .as_ref()
