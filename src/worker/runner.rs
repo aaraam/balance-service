@@ -6,6 +6,7 @@ use crate::AppState;
 use anyhow::anyhow;
 use bson::{doc, DateTime};
 use futures::stream::{self, StreamExt};
+use futures::TryStreamExt;
 use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
 use serde_json::json;
 use tokio::time::{sleep, Duration}; // ✅ Added for rate limiting
@@ -127,12 +128,180 @@ fn tron_contracts_from_request(req: &BalanceRequest) -> Vec<String> {
 }
 
 pub async fn run_worker(state: AppState) {
+    let worker_pool = state
+        .cfg
+        .worker_concurrency
+        .max(1) as usize;
+
+    tracing::info!(
+        worker_enabled = state.cfg.worker_enabled,
+        worker_pool = worker_pool,
+        "worker started"
+    );
+
+    // If NATS/JetStream is not configured, we fall back to the old Mongo scan loop.
+// (This keeps local dev working without extra infra.)
+    if state.cfg.nats_url.trim().is_empty() {
+        tracing::warn!("NATS_URL is empty; falling back to Mongo scan loop");
+        run_worker_mongo_fallback(state).await;
+        return;
+    }
+
+    let queue = state.queue.clone();
+
+    // Ensure stream + consumer exist
+    if let Err(e) = queue.ensure_stream().await {
+        tracing::error!(error = %e, "failed to ensure JetStream stream; falling back to Mongo scan loop");
+        run_worker_mongo_fallback(state).await;
+        return;
+    }
+
+    let consumer = match queue.get_or_create_consumer().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to get/create JetStream consumer; falling back to Mongo scan loop");
+            run_worker_mongo_fallback(state).await;
+            return;
+        }
+    };
+
+loop {
+        if !state.cfg.worker_enabled {
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            continue;
+        }
+
+        // Pull a batch and process in parallel, but with bounded concurrency.
+        let poll_ms = state.cfg.worker_poll_ms.max(50);
+        let mut messages = match consumer
+            .fetch()
+            .max_messages(32)
+            .expires(Duration::from_millis(poll_ms))
+            .messages()
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "JetStream fetch failed; sleeping 1000ms");
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                continue;
+            }
+        };
+
+        let batch: Vec<async_nats::jetstream::Message> = match messages.try_collect().await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(error = %e, "JetStream fetch stream error; sleeping 1000ms");
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                continue;
+            }
+        };
+
+        if batch.is_empty() {
+            tokio::time::sleep(Duration::from_millis(poll_ms)).await;
+            continue;
+        }
+
+let state_ref = &state;
+        stream::iter(batch)
+            .for_each_concurrent(worker_pool, |msg| async move {
+                let request_key = match std::str::from_utf8(msg.payload.as_ref()) {
+                    Ok(k) => k.trim().to_string(),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "dropping message: cannot decode requestKey");
+                        // With async-nats 0.46, nak() takes no args.
+                        let _ = msg.ack_with(async_nats::jetstream::AckKind::Nak(None)).await;
+                        return;
+                    }
+                };
+
+       async fn claim_job_by_key(state: &AppState, request_key: &str) -> Result<bool, mongodb::error::Error> {
+    let coll = state
+        .mongo
+        .db
+        .collection::<bson::Document>("balance_refresh_jobs");
+    let now = DateTime::now();
+
+    let filter = doc! {
+        "requestKey": request_key,
+        "status": "queued",
+        "$or": [
+            { "nextRetryAt": bson::Bson::Null },
+            { "nextRetryAt": { "$lte": now } }
+        ]
+    };
+
+    let update = doc! {
+        "$set": { "status": "running", "updatedAt": now }
+    };
+
+    let opts = FindOneAndUpdateOptions::builder()
+        .return_document(ReturnDocument::After)
+        .build();
+
+    let doc_opt = coll
+        .find_one_and_update(filter, update)
+        .with_options(opts)
+        .await?;
+
+    Ok(doc_opt.is_some())
+}
+
+
+         // Mongo is the source of truth: claim by requestKey.
+                match claim_job_by_key(state_ref, &request_key).await {
+                    Ok(true) => {
+                        JOBS_CLAIMED.fetch_add(1, Ordering::Relaxed);
+                        tracing::info!(request_key = %request_key, "claimed job");
+
+                        let job_start = Instant::now();
+                        let res = process_job(state_ref, &request_key).await;
+
+                        match res {
+                            Ok(_) => {
+                                JOBS_DONE.fetch_add(1, Ordering::Relaxed);
+                                tracing::info!(
+                                    request_key = %request_key,
+                                    elapsed_ms = job_start.elapsed().as_millis(),
+                                    "job done"
+                                );
+                                let _ = msg.ack().await;
+                            }
+                            Err(e) => {
+                                JOBS_FAILED.fetch_add(1, Ordering::Relaxed);
+                                tracing::error!(
+                                    request_key = %request_key,
+                                    elapsed_ms = job_start.elapsed().as_millis(),
+                                    error = %e,
+                                    "job failed"
+                                );
+                                let _ = mark_job_failed(state_ref, &request_key).await;
+                                let _ = msg.ack_with(async_nats::jetstream::AckKind::Nak(None)).await;
+                            }
+                        }
+                    }
+                    Ok(false) => {
+                        // Someone else has it, or it's not eligible yet.
+                        let _ = msg.ack().await;
+                    }
+                    Err(e) => {
+                        tracing::error!(request_key=%request_key, error=%e, "failed to claim job in Mongo");
+                        let _ = msg.ack_with(async_nats::jetstream::AckKind::Nak(None)).await;
+                    }
+                }
+            })
+            .await;
+    }
+}
+
+/// Fallback behavior: old Mongo scan loop (single-threaded) so dev environments still work.
+async fn run_worker_mongo_fallback(state: AppState) {
     let poll_ms = state.cfg.worker_poll_ms;
 
     tracing::info!(
         worker_enabled = state.cfg.worker_enabled,
         poll_ms = poll_ms,
-        "worker started"
+        "worker mongo fallback started"
     );
 
     loop {
@@ -144,11 +313,7 @@ pub async fn run_worker(state: AppState) {
         match claim_next_job(&state).await {
             Ok(Some(request_key)) => {
                 JOBS_CLAIMED.fetch_add(1, Ordering::Relaxed);
-                tracing::info!(
-                    request_key = %request_key,
-                    jobs_claimed = JOBS_CLAIMED.load(Ordering::Relaxed),
-                    "claimed job"
-                );
+                tracing::info!(request_key = %request_key, "claimed job (mongo)");
 
                 let job_start = Instant::now();
                 let res = process_job(&state, &request_key).await;
@@ -159,9 +324,7 @@ pub async fn run_worker(state: AppState) {
                         tracing::info!(
                             request_key = %request_key,
                             elapsed_ms = job_start.elapsed().as_millis(),
-                            jobs_done = JOBS_DONE.load(Ordering::Relaxed),
-                            jobs_failed = JOBS_FAILED.load(Ordering::Relaxed),
-                            "job done"
+                            "job done (mongo)"
                         );
                     }
                     Err(e) => {
@@ -170,9 +333,7 @@ pub async fn run_worker(state: AppState) {
                             request_key = %request_key,
                             elapsed_ms = job_start.elapsed().as_millis(),
                             error = %e,
-                            jobs_done = JOBS_DONE.load(Ordering::Relaxed),
-                            jobs_failed = JOBS_FAILED.load(Ordering::Relaxed),
-                            "job failed"
+                            "job failed (mongo)"
                         );
                         let _ = mark_job_failed(&state, &request_key).await;
                     }
@@ -960,3 +1121,8 @@ async fn mark_job_failed(state: &AppState, request_key: &str) -> Result<(), mong
 
     Ok(())
 }
+
+
+
+
+
