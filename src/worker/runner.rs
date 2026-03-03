@@ -51,11 +51,15 @@ fn is_valid_solana_pubkey_32(s: &str) -> bool {
 
 fn native_symbol_for(network: &str) -> &str {
     match network {
-        "eth" => "eth",
+        // All these networks use ETH for native gas
+        "eth" | "op" | "base" | "arb1" | "linea" | "aurora" => "eth",
         "bnb" => "bnb",
         "matic" => "matic",
-        "op" => "op",
-        _ => network,
+        "avax" => "avax",
+        "ftm" => "ftm",
+        "sol" => "sol",
+        "trx" => "trx",
+        _ => network, // Fallback for others
     }
 }
 
@@ -147,7 +151,6 @@ pub async fn run_worker(state: AppState) {
                 continue;
             }
         };
-
         let mut fetched = Vec::new();
         while let Some(msg_result) = batch_stream.next().await {
             if let Ok(msg) = msg_result {

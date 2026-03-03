@@ -1,0 +1,3447 @@
+==================================================
+FILE: src/chains.rs
+==================================================
+
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChainKey {
+    Eth,
+    Bnb,
+    Matic,
+    Op,
+    Gnosis,
+    Rstk,
+    Ethc,
+    Linea,
+    Base,
+    Mantle,
+    Mint,
+    Heco,
+    Avax,
+    Ftm,
+    Cro,
+    Arb1,
+    Palm,
+    Cypress,
+    Iotex,
+    Aurora,
+    Mcardano,
+    Okxchain,
+    Callisto,
+}
+
+impl ChainKey {
+    #[allow(dead_code)]
+    pub fn from_network_name(s: &str) -> Option<Self> {
+        match s {
+            "eth" => Some(Self::Eth),
+            "bnb" => Some(Self::Bnb),
+            "matic" => Some(Self::Matic),
+            "op" => Some(Self::Op),
+            "gnosis" => Some(Self::Gnosis),
+            "rstk" => Some(Self::Rstk),
+            "ethc" => Some(Self::Ethc),
+            "linea" => Some(Self::Linea),
+            "base" => Some(Self::Base),
+            "mantle" => Some(Self::Mantle),
+            "mint" => Some(Self::Mint),
+            "heco" => Some(Self::Heco),
+            "avax" => Some(Self::Avax),
+            "ftm" => Some(Self::Ftm),
+            "cro" => Some(Self::Cro),
+            "arb1" => Some(Self::Arb1),
+            "palm" => Some(Self::Palm),
+            "cypress" => Some(Self::Cypress),
+            "iotex" => Some(Self::Iotex),
+            "aurora" => Some(Self::Aurora),
+            "mcardano" => Some(Self::Mcardano),
+            "okxchain" => Some(Self::Okxchain),
+            "callisto" => Some(Self::Callisto),
+            _ => None,
+        }
+    }
+
+    pub fn chain_id(&self) -> u64 {
+        match self {
+            Self::Eth => 1,
+            Self::Bnb => 56,
+            Self::Matic => 137,
+            Self::Op => 10,
+            Self::Gnosis => 100,
+            Self::Rstk => 30,
+            Self::Ethc => 61,
+            Self::Linea => 59144,
+            Self::Base => 8453,
+            Self::Mantle => 5000,
+            Self::Mint => 185,
+            Self::Heco => 128,
+            Self::Avax => 43114,
+            Self::Ftm => 250,
+            Self::Cro => 25,
+            Self::Arb1 => 42161,
+            Self::Palm => 11297108109,
+            Self::Cypress => 8217,
+            Self::Iotex => 4689,
+            Self::Aurora => 18869,
+            Self::Mcardano => 2001,
+            Self::Okxchain => 66,
+            Self::Callisto => 820,
+        }
+    }
+
+    pub fn thirdweb_rpc_url(&self, client_id: &str) -> String {
+        format!("https://{}.rpc.thirdweb.com/{}", self.chain_id(), client_id)
+    }
+}
+
+// Central source of truth: networks we IGNORE even if client sends them.
+// NOTE: sol is no longer ignored (Phase 6).
+pub fn is_ignored_network(network_name: &str) -> bool {
+    matches!(network_name, "btc" | "doge")
+}
+
+pub fn supported_evm_networks() -> HashMap<&'static str, ChainKey> {
+    HashMap::from([
+        ("eth", ChainKey::Eth),
+        ("bnb", ChainKey::Bnb),
+        ("matic", ChainKey::Matic),
+        ("op", ChainKey::Op),
+        ("gnosis", ChainKey::Gnosis),
+        ("rstk", ChainKey::Rstk),
+        ("ethc", ChainKey::Ethc),
+        ("linea", ChainKey::Linea),
+        ("base", ChainKey::Base),
+        ("mantle", ChainKey::Mantle),
+        ("mint", ChainKey::Mint),
+        ("heco", ChainKey::Heco),
+        ("avax", ChainKey::Avax),
+        ("ftm", ChainKey::Ftm),
+        ("cro", ChainKey::Cro),
+        ("arb1", ChainKey::Arb1),
+        ("palm", ChainKey::Palm),
+        ("cypress", ChainKey::Cypress),
+        ("iotex", ChainKey::Iotex),
+        ("aurora", ChainKey::Aurora),
+        ("mcardano", ChainKey::Mcardano),
+        ("okxchain", ChainKey::Okxchain),
+        ("callisto", ChainKey::Callisto),
+    ])
+}
+
+
+
+==================================================
+FILE: src/config.rs
+==================================================
+
+use thiserror::Error;
+
+#[derive(Debug, Clone)]
+pub struct AppConfig {
+    pub bind_addr: String,
+    pub mongodb_uri: String,
+    pub mongodb_db_main: String,
+
+    // Worker
+    pub worker_enabled: bool,
+    // legacy (mongo polling). kept for compatibility but unused in JetStream mode
+    pub worker_poll_ms: u64,
+    pub worker_concurrency: u32,
+
+    // NEW: slows down processing so you can SEE logs/state changes
+    pub worker_slow_ms: u64,
+
+    // Queue (NATS JetStream)
+    pub nats_url: String,
+    pub nats_stream: String,
+    pub nats_subject: String,
+    pub nats_durable: String,
+    pub nats_max_ack_pending: i64,
+    pub nats_ack_wait_secs: u64,
+
+    // Thirdweb
+    pub thirdweb_client_id: String,
+
+    // Solana (native + SPL via getTokenAccountsByOwner)
+    pub solana_rpc_url: String,
+
+    // NEW: outbound HTTP timeout for RPC calls (EVM + SOL)
+    pub rpc_timeout_ms: u64,
+
+    // ───────── TRON ─────────
+    pub tron_fullnode_url: String,
+    pub tron_solidity_url: String,
+    pub tron_api_key: Option<String>,
+}
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("missing env var: {0}")]
+    MissingEnv(&'static str),
+}
+
+impl AppConfig {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        let bind_addr = std::env::var("BIND_ADDR")
+            .or_else(|_| std::env::var("BIND_ADDRESS"))
+            .unwrap_or_else(|_| "[::]:3459".to_string());
+
+        let mongodb_uri =
+            std::env::var("MONGODB_URI").map_err(|_| ConfigError::MissingEnv("MONGODB_URI"))?;
+
+        let mongodb_db_main = std::env::var("MONGODB_DB_MAIN")
+            .map_err(|_| ConfigError::MissingEnv("MONGODB_DB_MAIN"))?;
+
+        let thirdweb_client_id = std::env::var("THIRD_WEB_CLIENT_ID")
+            .map_err(|_| ConfigError::MissingEnv("THIRD_WEB_CLIENT_ID"))?;
+
+        // optional env vars
+        let worker_enabled = std::env::var("WORKER_ENABLED")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true);
+
+        let worker_poll_ms = std::env::var("WORKER_POLL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(500);
+
+        let worker_concurrency = std::env::var("WORKER_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(8);
+
+        let worker_slow_ms = std::env::var("WORKER_SLOW_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+
+        let nats_url =
+            std::env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".to_string());
+        let nats_stream =
+            std::env::var("NATS_STREAM").unwrap_or_else(|_| "BALANCE_REFRESH".to_string());
+        let nats_subject =
+            std::env::var("NATS_SUBJECT").unwrap_or_else(|_| "balance.refresh".to_string());
+        let nats_durable =
+            std::env::var("NATS_DURABLE").unwrap_or_else(|_| "balance-worker".to_string());
+
+        let nats_max_ack_pending = std::env::var("NATS_MAX_ACK_PENDING")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(10_000);
+
+        let nats_ack_wait_secs = std::env::var("NATS_ACK_WAIT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(120);
+
+        let solana_rpc_url = std::env::var("SOLANA_RPC_URL")
+            .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+
+        let rpc_timeout_ms = std::env::var("RPC_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(12_000);
+
+        let tron_fullnode_url = std::env::var("TRON_FULLNODE_URL").unwrap_or_default();
+        let tron_solidity_url = std::env::var("TRON_SOLIDITY_URL").unwrap_or_default();
+        let tron_api_key = std::env::var("TRON_TEMP_KEY").ok();
+
+        Ok(Self {
+            bind_addr,
+            mongodb_uri,
+            mongodb_db_main,
+            thirdweb_client_id,
+            worker_enabled,
+            worker_poll_ms,
+            worker_concurrency,
+            worker_slow_ms,
+            nats_url,
+            nats_stream,
+            nats_subject,
+            nats_durable,
+            nats_max_ack_pending,
+            nats_ack_wait_secs,
+            solana_rpc_url,
+            rpc_timeout_ms,
+            tron_fullnode_url,
+            tron_solidity_url,
+            tron_api_key,
+        })
+    }
+}
+
+
+==================================================
+FILE: src/core/key.rs
+==================================================
+
+use sha2::{Digest, Sha256};
+
+pub fn request_key_from_canonical_json(canonical_json: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(canonical_json.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+
+
+==================================================
+FILE: src/core/mod.rs
+==================================================
+
+pub mod key;
+pub mod normalize;
+
+
+
+==================================================
+FILE: src/core/normalize.rs
+==================================================
+
+use crate::chains::is_ignored_network;
+use crate::http::dto::{BalanceRequest, ContractGroup};
+
+fn is_valid_evm_h160(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let t = t.strip_prefix("0x").unwrap_or(t);
+    if t.len() != 40 {
+        return false;
+    }
+    t.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn is_valid_solana_pubkey_32(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let decoded = match bs58::decode(t).into_vec() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    decoded.len() == 32
+}
+
+pub fn supported_evm_networks() -> std::collections::HashMap<&'static str, &'static str> {
+    let mut m = std::collections::HashMap::new();
+    m.insert("eth", "Ethereum");
+    m.insert("bnb", "BNB Chain");
+    m.insert("matic", "Polygon");
+    m.insert("op", "Optimism");
+    m.insert("gnosis", "Gnosis");
+    m.insert("rstk", "Rootstock");
+    m.insert("ethc", "Ethereum Classic");
+    m.insert("linea", "Linea");
+    m.insert("base", "Base");
+    m.insert("mantle", "Mantle");
+    m.insert("mint", "Mint");
+    m.insert("heco", "HECO");
+    m.insert("avax", "Avalanche");
+    m.insert("ftm", "Fantom");
+    m.insert("cro", "Cronos");
+    m.insert("arb1", "Arbitrum One");
+    m.insert("palm", "Palm");
+    m.insert("cypress", "Klaytn Cypress");
+    m.insert("iotex", "IoTeX");
+    m.insert("aurora", "Aurora");
+    m.insert("mcardano", "Milkomeda Cardano");
+    m.insert("okxchain", "OKX Chain");
+    m.insert("callisto", "Callisto");
+    m
+}
+
+pub fn normalize_request(req: &BalanceRequest) -> BalanceRequest {
+    let evm_supported = supported_evm_networks();
+
+    let mut wallet_addresses: Vec<String> = req
+        .wallet_addresses
+        .iter()
+        .map(|w| w.to_lowercase())
+        .filter(|w| is_valid_evm_h160(w))
+        .collect();
+    wallet_addresses.sort();
+    wallet_addresses.dedup();
+
+    let mut sol_wallets: Vec<String> = req
+        .solana_wallet_addresses
+        .iter()
+        .map(|w| w.trim().to_string())
+        .filter(|w| is_valid_solana_pubkey_32(w))
+        .collect();
+    sol_wallets.sort();
+    sol_wallets.dedup();
+
+    // TRON IS DISABLED. We clear any TRON input immediately.
+    let tron_wallets: Vec<String> = Vec::new();
+
+    let mut contracts: Vec<ContractGroup> = req
+        .contracts
+        .iter()
+        .filter_map(|c| {
+            let net = c.network_name.to_lowercase();
+
+            if is_ignored_network(net.as_str()) || net == "trx" {
+                return None;
+            }
+
+            if net != "sol" && !evm_supported.contains_key(net.as_str()) {
+                return None;
+            }
+
+            let mut addrs: Vec<String> = if net == "sol" {
+                c.contract_addresses
+                    .iter()
+                    .map(|a| a.trim().to_string())
+                    .filter(|a| is_valid_solana_pubkey_32(a))
+                    .collect()
+            } else {
+                c.contract_addresses
+                    .iter()
+                    .map(|a| a.to_lowercase())
+                    .filter(|a| is_valid_evm_h160(a))
+                    .collect()
+            };
+            addrs.sort();
+            addrs.dedup();
+
+            Some(ContractGroup {
+                network_name: net,
+                contract_addresses: addrs,
+            })
+        })
+        .filter(|cg| !cg.contract_addresses.is_empty())
+        .collect();
+
+    contracts.sort_by(|a, b| a.network_name.cmp(&b.network_name));
+
+    BalanceRequest {
+        hard_refresh: req.hard_refresh,
+        contracts,
+        wallet_addresses,
+        solana_wallet_addresses: sol_wallets,
+        tron_wallet_addresses: tron_wallets,
+        doge_wallet_addresses: vec![],
+        btc_wallet_addresses: vec![],
+    }
+}
+
+
+==================================================
+FILE: src/db/mod.rs
+==================================================
+
+pub mod models;
+pub mod mongo;
+pub mod refresh_jobs;
+pub mod snapshots;
+
+
+
+==================================================
+FILE: src/db/models.rs
+==================================================
+
+// ==================================================
+// balance-service\src\db\models.rs
+// ==================================================
+
+use bson::DateTime;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceSnapshotDoc {
+    pub request_key: String,
+    pub normalized_request: serde_json::Value,
+    pub result: serde_json::Value,
+    pub last_updated_at: DateTime,
+    pub refresh_state: String,
+
+    #[serde(default)]
+    pub is_complete: bool,
+
+    #[serde(default)]
+    pub has_changed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceRefreshJobDoc {
+    pub request_key: String,
+    pub status: String, // queued | running | done | failed
+    pub attempts: i32,
+    pub next_retry_at: Option<DateTime>,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
+
+
+==================================================
+FILE: src/db/mongo.rs
+==================================================
+
+use crate::config::AppConfig;
+use mongodb::{Client, Database};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum MongoError {
+    #[error("mongodb error: {0}")]
+    Mongo(#[from] mongodb::error::Error),
+}
+
+#[derive(Clone)]
+pub struct Mongo {
+    pub db: Database,
+}
+
+impl Mongo {
+    pub async fn connect(cfg: &AppConfig) -> Result<Self, MongoError> {
+        let client = Client::with_uri_str(&cfg.mongodb_uri).await?;
+        let db = client.database(&cfg.mongodb_db_main);
+        Ok(Self { db })
+    }
+}
+
+
+
+==================================================
+FILE: src/db/refresh_jobs.rs
+==================================================
+
+use crate::db::models::BalanceRefreshJobDoc;
+use bson::{doc, DateTime};
+use mongodb::Collection;
+
+pub fn refresh_jobs_collection(db: &mongodb::Database) -> Collection<BalanceRefreshJobDoc> {
+    db.collection::<BalanceRefreshJobDoc>("balance_refresh_jobs")
+}
+
+pub async fn ensure_indexes(db: &mongodb::Database) -> Result<(), mongodb::error::Error> {
+    use mongodb::{options::IndexOptions, IndexModel};
+
+    let coll = refresh_jobs_collection(db);
+
+    let model = IndexModel::builder()
+        .keys(doc! { "requestKey": 1 })
+        .options(IndexOptions::builder().unique(true).build())
+        .build();
+
+    coll.create_index(model).await?;
+
+    // Worker claim helper index
+    let model2 = IndexModel::builder()
+        .keys(doc! { "status": 1, "nextRetryAt": 1, "updatedAt": -1 })
+        .options(IndexOptions::builder().build())
+        .build();
+
+    coll.create_index(model2).await?;
+    Ok(())
+}
+
+/// Enqueue a refresh job if it doesn't exist.
+/// If it exists and is `done` or `failed`, re-queue it.
+/// If it's already `queued` or `running`, do nothing.
+pub async fn enqueue_or_requeue(
+    db: &mongodb::Database,
+    request_key: &str,
+) -> Result<bool, mongodb::error::Error> {
+    let coll = refresh_jobs_collection(db);
+    let now = DateTime::now();
+
+    tracing::debug!(request_key=%request_key, "enqueue_or_requeue called");
+
+    let requeue_filter = doc! {
+        "requestKey": request_key,
+        "status": { "$in": ["done", "failed"] }
+    };
+
+    let requeue_update = doc! {
+        "$set": {
+            "status": "queued",
+            "updatedAt": now,
+            "nextRetryAt": bson::Bson::Null,
+            "attempts": 0
+        }
+    };
+
+    let requeue_result = coll
+        .update_one(requeue_filter, requeue_update)
+        .upsert(false)
+        .await?;
+
+    tracing::debug!(
+        request_key=%request_key,
+        matched=?requeue_result.matched_count,
+        modified=?requeue_result.modified_count,
+        "requeue attempt finished"
+    );
+
+    if requeue_result.modified_count == 1 {
+        tracing::info!(request_key=%request_key, "job re-queued (was done/failed)");
+        return Ok(true);
+    }
+
+    let insert_filter = doc! { "requestKey": request_key };
+    let insert_update = doc! {
+        "$setOnInsert": {
+            "requestKey": request_key,
+            "status": "queued",
+            "attempts": 0,
+            "nextRetryAt": bson::Bson::Null,
+            "createdAt": now,
+            "updatedAt": now
+        }
+    };
+
+    let insert_result = coll
+        .update_one(insert_filter, insert_update)
+        .upsert(true)
+        .await?;
+
+    let did_insert = insert_result.upserted_id.is_some();
+
+    tracing::info!(
+        request_key=%request_key,
+        did_insert=did_insert,
+        matched=?insert_result.matched_count,
+        modified=?insert_result.modified_count,
+        "insert attempt finished"
+    );
+
+    Ok(did_insert)
+}
+
+
+==================================================
+FILE: src/db/snapshots.rs
+==================================================
+
+// ==================================================
+// FILE: D:\Learn\rust\balance-service\src\db\snapshots.rs
+// ==================================================
+
+use crate::db::models::BalanceSnapshotDoc;
+use bson::doc;
+use mongodb::{options::FindOneOptions, Collection};
+use serde::{Deserialize, Serialize};
+
+// ✅ Mini-struct for type-safe status checking
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SnapshotStatus {
+    #[serde(rename = "isComplete", default)]
+    pub is_complete: bool,
+    #[serde(rename = "hasChanged", default)]
+    pub has_changed: bool,
+    #[serde(rename = "requestKey")]
+    pub request_key: String,
+}
+
+pub fn snapshots_collection(db: &mongodb::Database) -> Collection<BalanceSnapshotDoc> {
+    db.collection::<BalanceSnapshotDoc>("balance_snapshots")
+}
+
+/// Create unique index on requestKey once
+pub async fn ensure_indexes(db: &mongodb::Database) -> Result<(), mongodb::error::Error> {
+    use mongodb::options::IndexOptions;
+    use mongodb::IndexModel;
+
+    let coll = snapshots_collection(db);
+    let model = IndexModel::builder()
+        .keys(doc! { "requestKey": 1 })
+        .options(IndexOptions::builder().unique(true).build())
+        .build();
+
+    coll.create_index(model).await?;
+    Ok(())
+}
+
+/// ✅ Fetch ONLY status fields (Lightweight) using projection
+pub async fn get_snapshot_status(
+    db: &mongodb::Database,
+    request_key: &str,
+) -> Result<Option<SnapshotStatus>, mongodb::error::Error> {
+    // We use a raw document collection for the projection, then deserialize to our struct
+    let coll = db.collection::<SnapshotStatus>("balance_snapshots");
+
+    let filter = doc! { "requestKey": request_key };
+
+    let options = FindOneOptions::builder()
+        .projection(doc! {
+            "isComplete": 1,
+            "hasChanged": 1,
+            "requestKey": 1,
+            "_id": 0
+        })
+        .build();
+
+    // ✅ FIXED: Chained .with_options() correctly
+    coll.find_one(filter).with_options(options).await
+}
+
+pub async fn get_snapshot(
+    db: &mongodb::Database,
+    request_key: &str,
+) -> Result<Option<BalanceSnapshotDoc>, mongodb::error::Error> {
+    let coll = snapshots_collection(db);
+    let filter = doc! { "requestKey": request_key };
+    // ✅ FIXED: Removed unnecessary 'None' argument
+    coll.find_one(filter).await
+}
+
+pub async fn upsert_empty_snapshot(
+    db: &mongodb::Database,
+    request_key: &str,
+    normalized_request_json: serde_json::Value,
+    empty_result_json: serde_json::Value,
+) -> Result<(), mongodb::error::Error> {
+    let coll = snapshots_collection(db);
+    let filter = doc! { "requestKey": request_key };
+
+    let now = bson::DateTime::now();
+
+    let update = doc! {
+        "$setOnInsert": {
+            "requestKey": request_key,
+            "normalizedRequest": bson::to_bson(&normalized_request_json)
+                .unwrap_or(bson::Bson::Null),
+            "result": bson::to_bson(&empty_result_json)
+                .unwrap_or(bson::Bson::Null),
+            "lastUpdatedAt": now,
+            "refreshState": "idle",
+            "isComplete": false,
+            "hasChanged": false
+        }
+    };
+
+    coll.update_one(filter, update).upsert(true).await?;
+
+    Ok(())
+}
+
+pub async fn set_refresh_state(
+    db: &mongodb::Database,
+    request_key: &str,
+    state: &str,
+) -> Result<(), mongodb::error::Error> {
+    let coll = snapshots_collection(db);
+
+    coll.update_one(
+        doc! { "requestKey": request_key },
+        doc! { "$set": { "refreshState": state } },
+    )
+    .await?;
+
+    Ok(())
+}
+
+
+
+==================================================
+FILE: src/evm/format.rs
+==================================================
+
+use ethereum_types::U256;
+
+/// 10^decimals as U256 (decimals is usually <= 18)
+fn pow10(decimals: u32) -> U256 {
+    let mut x = U256::from(1u64);
+    for _ in 0..decimals {
+        x = x * U256::from(10u64);
+    }
+    x
+}
+
+/// Convert U256 base-units into decimal string.
+/// - decimals: token decimals (e.g., 18, 6)
+/// - trim: if true, trim trailing zeros from fractional part (nice for native tokens)
+pub fn u256_to_decimal_string(value: U256, decimals: u32, trim: bool) -> String {
+    if decimals == 0 {
+        return value.to_string();
+    }
+
+    let base = pow10(decimals);
+    let whole = value / base;
+    let frac = value % base;
+
+    // pad fractional to fixed width
+    let mut frac_str = frac.to_string();
+    if frac_str.len() < decimals as usize {
+        let pad = "0".repeat(decimals as usize - frac_str.len());
+        frac_str = format!("{}{}", pad, frac_str);
+    }
+
+    if trim {
+        // remove trailing zeros
+        while frac_str.ends_with('0') {
+            frac_str.pop();
+        }
+        if frac_str.is_empty() {
+            return whole.to_string();
+        }
+    }
+
+    format!("{}.{}", whole, frac_str)
+}
+
+
+
+==================================================
+FILE: src/evm/mod.rs
+==================================================
+
+pub mod format;
+pub mod multicall3;
+pub mod rpc;
+
+
+
+==================================================
+FILE: src/evm/multicall3.rs
+==================================================
+
+// ==================================================
+// balance-service\src\evm\multicall3.rs
+// ==================================================
+
+use anyhow::anyhow;
+use ethabi::{Function, Param, ParamType, StateMutability, Token};
+use ethereum_types::{H160, U256};
+use std::collections::HashMap;
+
+use super::rpc::RpcClient;
+
+pub const MULTICALL3_ADDR: &str = "0xcA11bde05977b3631167028862bE2a173976CA11";
+
+#[allow(deprecated)]
+fn fn_aggregate3() -> Function {
+    // aggregate3((address,bool,bytes)[]) returns ( (bool,bytes)[] )
+    Function {
+        name: "aggregate3".to_string(),
+        inputs: vec![Param {
+            name: "calls".to_string(),
+            kind: ParamType::Array(Box::new(ParamType::Tuple(vec![
+                ParamType::Address, // target
+                ParamType::Bool,    // allowFailure
+                ParamType::Bytes,   // callData
+            ]))),
+            internal_type: None,
+        }],
+        outputs: vec![Param {
+            name: "returnData".to_string(),
+            kind: ParamType::Array(Box::new(ParamType::Tuple(vec![
+                ParamType::Bool,  // success
+                ParamType::Bytes, // returnData
+            ]))),
+            internal_type: None,
+        }],
+        // ✅ Route A: keep field to satisfy ethabi struct init, but don’t use it
+        constant: None,
+        state_mutability: StateMutability::Payable,
+    }
+}
+
+#[allow(deprecated)]
+fn fn_decimals() -> Function {
+    Function {
+        name: "decimals".to_string(),
+        inputs: vec![],
+        outputs: vec![Param {
+            name: "decimals".to_string(),
+            kind: ParamType::Uint(8),
+            internal_type: None,
+        }],
+        // ✅ Route A
+        constant: None,
+        state_mutability: StateMutability::View,
+    }
+}
+
+fn u8_from_return_data(bytes: &[u8]) -> Option<u8> {
+    if bytes.is_empty() {
+        return None;
+    }
+    // ABI uint8 is still 32-byte word, take last byte safely
+    Some(*bytes.last()?)
+}
+
+#[allow(deprecated)]
+fn fn_get_eth_balance() -> Function {
+    Function {
+        name: "getEthBalance".to_string(),
+        inputs: vec![Param {
+            name: "addr".to_string(),
+            kind: ParamType::Address,
+            internal_type: None,
+        }],
+        outputs: vec![Param {
+            name: "balance".to_string(),
+            kind: ParamType::Uint(256),
+            internal_type: None,
+        }],
+        // ✅ Route A
+        constant: None,
+        state_mutability: StateMutability::View,
+    }
+}
+
+#[allow(deprecated)]
+fn fn_balance_of() -> Function {
+    Function {
+        name: "balanceOf".to_string(),
+        inputs: vec![Param {
+            name: "account".to_string(),
+            kind: ParamType::Address,
+            internal_type: None,
+        }],
+        outputs: vec![Param {
+            name: "balance".to_string(),
+            kind: ParamType::Uint(256),
+            internal_type: None,
+        }],
+        // ✅ Route A: keep it, don’t care about it
+        constant: None,
+        state_mutability: StateMutability::View,
+    }
+}
+
+fn parse_h160(addr: &str) -> Result<H160, anyhow::Error> {
+    let a = addr.trim();
+    let a = a.strip_prefix("0x").unwrap_or(a);
+    let bytes = hex::decode(a)?;
+    if bytes.len() != 20 {
+        return Err(anyhow!("invalid address len: {} for {}", bytes.len(), addr));
+    }
+    Ok(H160::from_slice(&bytes))
+}
+
+fn u256_from_return_data(bytes: &[u8]) -> U256 {
+    // expects 32 bytes, but tolerate weirdness
+    if bytes.len() >= 32 {
+        U256::from_big_endian(&bytes[bytes.len() - 32..])
+    } else {
+        let mut padded = vec![0u8; 32 - bytes.len()];
+        padded.extend_from_slice(bytes);
+        U256::from_big_endian(&padded)
+    }
+}
+
+pub struct EvmBalances {
+    pub native: HashMap<String, U256>, // wallet -> native
+    pub erc20: HashMap<String, HashMap<String, U256>>, // wallet -> token -> bal
+}
+
+pub async fn fetch_token_decimals_multicall3(
+    rpc: &RpcClient,
+    token_contracts: &[String],
+    max_calls_per_batch: usize,
+) -> Result<HashMap<String, u32>, anyhow::Error> {
+    let agg = fn_aggregate3();
+    let decimals_fn = fn_decimals();
+
+    let mut call_tokens: Vec<Token> = vec![];
+    let mut metas: Vec<String> = vec![];
+
+    for t in token_contracts {
+        // call decimals() on token contract
+        let t_addr = parse_h160(t)?;
+        let calldata = decimals_fn.encode_input(&[])?;
+
+        metas.push(t.clone());
+        call_tokens.push(Token::Tuple(vec![
+            Token::Address(t_addr),
+            Token::Bool(true),
+            Token::Bytes(calldata),
+        ]));
+    }
+
+    let mut out: HashMap<String, u32> = HashMap::new();
+
+    let mut i = 0usize;
+    while i < call_tokens.len() {
+        let end = (i + max_calls_per_batch).min(call_tokens.len());
+        let chunk = call_tokens[i..end].to_vec();
+        let chunk_meta = metas[i..end].to_vec();
+
+        let input = agg.encode_input(&[Token::Array(chunk)])?;
+        let data_hex = format!("0x{}", hex::encode(input));
+
+        let raw = rpc.eth_call(MULTICALL3_ADDR, &data_hex).await?;
+        let raw = raw.strip_prefix("0x").unwrap_or(&raw);
+        let bytes = hex::decode(raw)?;
+
+        let decoded = agg.decode_output(&bytes)?;
+        let results = match decoded.get(0) {
+            Some(Token::Array(arr)) => arr,
+            _ => return Err(anyhow!("unexpected aggregate3 decode shape for decimals")),
+        };
+
+        for (idx, item) in results.iter().enumerate() {
+            let token_addr = &chunk_meta[idx];
+
+            let (success, returndata) = match item {
+                Token::Tuple(items) if items.len() == 2 => {
+                    let s = matches!(items[0], Token::Bool(true));
+                    let b = match &items[1] {
+                        Token::Bytes(bb) => bb.clone(),
+                        _ => vec![],
+                    };
+                    (s, b)
+                }
+                _ => (false, vec![]),
+            };
+
+            let dec = if success {
+                u8_from_return_data(&returndata).map(|x| x as u32)
+            } else {
+                None
+            };
+
+            // Default fallback if decimals() fails:
+            out.insert(token_addr.clone(), dec.unwrap_or(18));
+        }
+
+        i = end;
+    }
+
+    Ok(out)
+}
+
+pub async fn fetch_balances_multicall3(
+    rpc: &RpcClient,
+    wallets: &[String],
+    token_contracts: &[String],
+    max_calls_per_batch: usize,
+) -> Result<EvmBalances, anyhow::Error> {
+    let agg = fn_aggregate3();
+    let get_eth = fn_get_eth_balance();
+    let bal_of = fn_balance_of();
+
+    // Build calls in a stable order so decoding aligns
+    // Call layout:
+    // 1) native for each wallet via getEthBalance
+    // 2) balanceOf for each token for each wallet (wallet-major)
+    #[derive(Clone)]
+    struct CallMeta {
+        kind: &'static str, // "native" | "erc20"
+        wallet: String,
+        token: Option<String>,
+    }
+
+    let mut call_metas: Vec<CallMeta> = vec![];
+    let mut call_tokens: Vec<Token> = vec![];
+
+    // native calls
+    for w in wallets {
+        let w_addr = parse_h160(w)?;
+        let calldata = get_eth.encode_input(&[Token::Address(w_addr)])?;
+        call_metas.push(CallMeta {
+            kind: "native",
+            wallet: w.clone(),
+            token: None,
+        });
+
+        call_tokens.push(Token::Tuple(vec![
+            Token::Address(parse_h160(MULTICALL3_ADDR)?), // target = Multicall3 itself
+            Token::Bool(true),                            // allowFailure
+            Token::Bytes(calldata),
+        ]));
+    }
+
+    // erc20 calls
+    for w in wallets {
+        let w_addr = parse_h160(w)?;
+        for t in token_contracts {
+            let t_addr = parse_h160(t)?;
+            let calldata = bal_of.encode_input(&[Token::Address(w_addr)])?;
+
+            call_metas.push(CallMeta {
+                kind: "erc20",
+                wallet: w.clone(),
+                token: Some(t.clone()),
+            });
+
+            call_tokens.push(Token::Tuple(vec![
+                Token::Address(t_addr), // target = token contract
+                Token::Bool(true),      // allowFailure
+                Token::Bytes(calldata), // callData
+            ]));
+        }
+    }
+
+    // Batch into multiple multicalls if too large
+    let mut native: HashMap<String, U256> = HashMap::new();
+    let mut erc20: HashMap<String, HashMap<String, U256>> = HashMap::new();
+
+    let mut i = 0usize;
+    while i < call_tokens.len() {
+        let end = (i + max_calls_per_batch).min(call_tokens.len());
+        let chunk_tokens = call_tokens[i..end].to_vec();
+        let chunk_metas = call_metas[i..end].to_vec();
+
+        let input = agg.encode_input(&[Token::Array(chunk_tokens)])?;
+        let data_hex = format!("0x{}", hex::encode(input));
+
+        let raw = rpc.eth_call(MULTICALL3_ADDR, &data_hex).await?;
+        let raw = raw.strip_prefix("0x").unwrap_or(&raw);
+        let out_bytes = hex::decode(raw)?;
+
+        let decoded = agg.decode_output(&out_bytes)?;
+        // decoded[0] = Array(Tuple(success, bytes))
+        let results = match decoded.get(0) {
+            Some(Token::Array(arr)) => arr,
+            _ => return Err(anyhow!("unexpected aggregate3 decode shape")),
+        };
+
+        for (idx, item) in results.iter().enumerate() {
+            let meta = &chunk_metas[idx];
+
+            let (success, returndata) = match item {
+                Token::Tuple(items) if items.len() == 2 => {
+                    let s = matches!(items[0], Token::Bool(true));
+                    let bytes = match &items[1] {
+                        Token::Bytes(b) => b.clone(),
+                        _ => vec![],
+                    };
+                    (s, bytes)
+                }
+                _ => (false, vec![]),
+            };
+
+            let value = if success && !returndata.is_empty() {
+                u256_from_return_data(&returndata)
+            } else {
+                U256::zero()
+            };
+
+            match meta.kind {
+                "native" => {
+                    native.insert(meta.wallet.clone(), value);
+                }
+                "erc20" => {
+                    let token = meta.token.clone().unwrap();
+                    erc20
+                        .entry(meta.wallet.clone())
+                        .or_default()
+                        .insert(token, value);
+                }
+                _ => {}
+            }
+        }
+
+        i = end;
+    }
+
+    Ok(EvmBalances { native, erc20 })
+}
+
+
+
+==================================================
+FILE: src/evm/rpc.rs
+==================================================
+
+use anyhow::anyhow;
+use reqwest::Client;
+use serde_json::json;
+use std::time::Duration;
+
+#[derive(Clone)]
+pub struct RpcClient {
+    http: Client,
+    rpc_url: String,
+}
+
+impl RpcClient {
+    pub fn new(rpc_url: String, timeout_ms: u64) -> Self {
+        let http = Client::builder()
+            .timeout(Duration::from_millis(timeout_ms))
+            .build()
+            .expect("failed to build reqwest client");
+
+        Self { http, rpc_url }
+    }
+
+    pub async fn eth_call(&self, to: &str, data: &str) -> Result<String, anyhow::Error> {
+        // thirdweb expects standard json-rpc
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_call",
+            "params": [
+                {
+                    "to": to,
+                    "data": data
+                },
+                "latest"
+            ]
+        });
+
+        let res = self.http.post(&self.rpc_url).json(&payload).send().await?;
+
+        let status = res.status();
+        let v: serde_json::Value = res.json().await?;
+
+        if !status.is_success() {
+            return Err(anyhow!("rpc http error: status={} body={}", status, v));
+        }
+
+        if let Some(err) = v.get("error") {
+            return Err(anyhow!("rpc error: {}", err));
+        }
+
+        let result = v
+            .get("result")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| anyhow!("missing rpc result: {}", v))?;
+
+        Ok(result.to_string())
+    }
+}
+
+
+
+==================================================
+FILE: src/http/dto.rs
+==================================================
+
+use serde::{Deserialize, Serialize};
+use crate::http::error::ApiErrorBody;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContractGroup {
+    pub network_name: String,
+    pub contract_addresses: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceRequest {
+    #[serde(default)]
+    pub hard_refresh: bool,
+
+    #[serde(default)]
+    pub contracts: Vec<ContractGroup>,
+
+    #[serde(default)]
+    pub wallet_addresses: Vec<String>,
+
+    #[serde(default)]
+    pub solana_wallet_addresses: Vec<String>,
+
+    #[serde(default)]
+    pub tron_wallet_addresses: Vec<String>,
+
+    #[serde(default)]
+    pub doge_wallet_addresses: Vec<String>,
+    #[serde(default)]
+    pub btc_wallet_addresses: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BalanceResponse {
+    pub status: bool,
+
+    #[serde(rename = "isComplete")]
+    pub is_complete: bool,
+
+    #[serde(rename = "hasChanged")]
+    pub has_changed: bool,
+
+    #[serde(rename = "requestKey")]
+    pub request_key: String,
+
+    pub result: serde_json::Value,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ApiErrorBody>,
+}
+
+const ZERO_18: &str = "0.000000000000000000";
+
+fn native_symbol_for(network: &str) -> &str {
+    match network {
+        "eth" => "eth",
+        "bnb" => "bnb",
+        "matic" => "matic",
+        "op" => "op",
+        "sol" => "sol",
+        "trx" => "trx",
+        _ => network,
+    }
+}
+
+fn sol_mints_from_request(req: &BalanceRequest) -> Vec<String> {
+    req.contracts
+        .iter()
+        .find(|c| c.network_name == "sol")
+        .map(|c| c.contract_addresses.clone())
+        .unwrap_or_default()
+}
+
+pub fn zero_result_from_request(req: &BalanceRequest) -> serde_json::Value {
+    use serde_json::json;
+    use serde_json::Map;
+
+    let sol_mints = sol_mints_from_request(req);
+    let mut data: Vec<serde_json::Value> = Vec::new();
+
+    // ---- EVM rows ----
+    for w in &req.wallet_addresses {
+        let mut balance_obj: Map<String, serde_json::Value> = Map::new();
+
+        for cg in &req.contracts {
+            let net = cg.network_name.as_str();
+
+            if net == "sol" || net == "trx" {
+                continue;
+            }
+
+            let mut chain_obj: Map<String, serde_json::Value> = Map::new();
+            chain_obj.insert(native_symbol_for(net).to_string(), json!(ZERO_18));
+
+            for token_addr in &cg.contract_addresses {
+                chain_obj.insert(token_addr.clone(), json!(ZERO_18));
+            }
+
+            balance_obj.insert(net.to_string(), json!(chain_obj));
+        }
+
+        data.push(json!({
+            "walletAddress": w,
+            "balance": balance_obj
+        }));
+    }
+
+    // ---- SOL rows ----
+    for w in &req.solana_wallet_addresses {
+        let mut balance_obj: Map<String, serde_json::Value> = Map::new();
+        let mut sol_obj: Map<String, serde_json::Value> = Map::new();
+        
+        sol_obj.insert("sol".to_string(), json!(ZERO_18));
+
+        for mint in &sol_mints {
+            sol_obj.insert(mint.clone(), json!(ZERO_18));
+        }
+
+        balance_obj.insert("sol".to_string(), json!(sol_obj));
+
+        data.push(json!({
+            "walletAddress": w,
+            "balance": balance_obj
+        }));
+    }
+
+    // ---- Totals ----
+    let mut totals: Map<String, serde_json::Value> = Map::new();
+
+    for cg in &req.contracts {
+        let net = cg.network_name.as_str();
+
+        if net == "sol" || net == "trx" {
+            continue;
+        }
+
+        let mut total_chain_obj: Map<String, serde_json::Value> = Map::new();
+        total_chain_obj.insert(native_symbol_for(net).to_string(), json!(ZERO_18));
+
+        for token_addr in &cg.contract_addresses {
+            total_chain_obj.insert(token_addr.clone(), json!(ZERO_18));
+        }
+
+        totals.insert(net.to_string(), json!(total_chain_obj));
+    }
+
+    if !req.solana_wallet_addresses.is_empty() {
+        let mut sol_total_obj: Map<String, serde_json::Value> = Map::new();
+        sol_total_obj.insert("sol".to_string(), json!(ZERO_18));
+        
+        for mint in &sol_mints {
+            sol_total_obj.insert(mint.clone(), json!(ZERO_18));
+        }
+        
+        totals.insert("sol".to_string(), json!(sol_total_obj));
+    }
+
+    json!({
+        "data": data,
+        "total": { "balance": totals }
+    })
+}
+
+
+==================================================
+FILE: src/http/error.rs
+==================================================
+
+// ==================================================
+// FILE: D:\Learn\rust\balance-service\src\http\error.rs
+// ==================================================
+
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiErrorBody {
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApiError {
+    pub status: StatusCode,
+    pub body: ApiErrorBody,
+}
+
+impl ApiError {
+    pub fn bad_request(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        details: Option<Value>,
+    ) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            body: ApiErrorBody {
+                code: code.into(),
+                message: message.into(),
+                details,
+            },
+        }
+    }
+
+    pub fn too_many_requests(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        details: Option<Value>,
+    ) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            body: ApiErrorBody {
+                code: code.into(),
+                message: message.into(),
+                details,
+            },
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let payload = crate::http::dto::BalanceResponse {
+            status: false,
+            is_complete: false,
+            has_changed: false,
+            // ✅ FIXED: Field added
+            request_key: "".to_string(),
+            result: serde_json::json!({}),
+            error: Some(self.body),
+        };
+
+        (self.status, Json(payload)).into_response()
+    }
+}
+
+
+
+==================================================
+FILE: src/http/handlers.rs
+==================================================
+
+use crate::core::key::request_key_from_canonical_json;
+use crate::core::normalize::normalize_request;
+use crate::db::{refresh_jobs, snapshots};
+use crate::http::dto::{zero_result_from_request, BalanceRequest, BalanceResponse};
+use crate::http::validate::validate_request_limits;
+use crate::AppState;
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
+
+pub async fn health() -> impl IntoResponse {
+    (StatusCode::OK, "ok")
+}
+
+pub async fn get_job_status(
+    State(state): State<AppState>,
+    Path(request_key): Path<String>,
+) -> impl IntoResponse {
+    let snap = snapshots::get_snapshot(&state.mongo.db, &request_key).await;
+
+    match snap {
+        Ok(Some(s)) => {
+            let is_complete = s.is_complete;
+            let has_changed = s.has_changed;
+
+            (
+                StatusCode::OK,
+                Json(BalanceResponse {
+                    status: true,
+                    is_complete,
+                    has_changed,
+                    request_key,
+                    result: s.result,
+                    error: None,
+                }),
+            )
+                .into_response()
+        }
+        _ => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": false,
+                "message": "request_key not found"
+            })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn get_multi_wallet_balances(
+    State(state): State<AppState>,
+    Json(req): Json<BalanceRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = validate_request_limits(&req) {
+        return e.into_response();
+    }
+
+    let normalized = normalize_request(&req);
+
+    let canonical_json = match serde_json::to_string(&normalized) {
+        Ok(s) => s,
+        Err(e) => {
+            return crate::http::error::ApiError::bad_request(
+                "JSON_ERROR",
+                &e.to_string(),
+                None,
+            )
+            .into_response();
+        }
+    };
+
+    let request_key = request_key_from_canonical_json(&canonical_json);
+    let zero_result = zero_result_from_request(&normalized);
+
+    let snap = snapshots::get_snapshot(&state.mongo.db, &request_key).await;
+
+    match snap {
+        Ok(Some(existing)) => {
+            let existing_is_complete = existing.is_complete;
+            let should_refresh = !existing_is_complete;
+
+            if should_refresh {
+                if let Ok(did_queue) =
+                    refresh_jobs::enqueue_or_requeue(&state.mongo.db, &request_key).await
+                {
+                    if did_queue {
+                        let _ =
+                            snapshots::set_refresh_state(&state.mongo.db, &request_key, "queued")
+                                .await;
+
+                        // push to durable queue
+                        if let Err(e) = state.queue.publish(&request_key).await {
+                            tracing::error!(request_key=%request_key, error=%e, "failed to publish job to queue");
+                        }
+                    }
+                }
+            }
+
+            (
+                StatusCode::OK,
+                Json(BalanceResponse {
+                    status: true,
+                    is_complete: existing_is_complete,
+                    has_changed: existing.has_changed,
+                    result: existing.result,
+                    request_key,
+                    error: None,
+                }),
+            )
+                .into_response()
+        }
+
+        _ => {
+            let normalized_value = serde_json::to_value(&normalized).unwrap_or(serde_json::json!({}));
+            let _ = snapshots::upsert_empty_snapshot(
+                &state.mongo.db,
+                &request_key,
+                normalized_value,
+                zero_result.clone(),
+            )
+            .await;
+
+            if let Ok(did_queue) =
+                refresh_jobs::enqueue_or_requeue(&state.mongo.db, &request_key).await
+            {
+                if did_queue {
+                    let _ =
+                        snapshots::set_refresh_state(&state.mongo.db, &request_key, "queued").await;
+
+                    // push to durable queue
+                    if let Err(e) = state.queue.publish(&request_key).await {
+                        tracing::error!(request_key=%request_key, error=%e, "failed to publish job to queue");
+                    }
+                }
+            }
+
+            (
+                StatusCode::OK,
+                Json(BalanceResponse {
+                    status: true,
+                    is_complete: false,
+                    has_changed: false,
+                    result: zero_result,
+                    request_key,
+                    error: None,
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+
+==================================================
+FILE: src/http/mod.rs
+==================================================
+
+pub mod dto;
+pub mod handlers;
+
+pub mod error;
+pub mod validate;
+
+
+
+==================================================
+FILE: src/http/validate.rs
+==================================================
+
+use crate::core::normalize::supported_evm_networks;
+use crate::http::dto::{BalanceRequest, ContractGroup};
+use crate::http::error::ApiError;
+use serde_json::json;
+
+const MAX_EVM_WALLETS: usize = 150;
+const MAX_SOL_WALLETS: usize = 150;
+const MAX_CONTRACT_GROUPS: usize = 25;
+const MAX_CONTRACTS_PER_GROUP: usize = 250;
+
+const MAX_EVM_WORK_UNITS: usize = 10_000;
+const MAX_SOL_WORK_UNITS: usize = 10_000;
+
+pub fn validate_request_limits(req: &BalanceRequest) -> Result<(), ApiError> {
+    if req.wallet_addresses.len() > MAX_EVM_WALLETS {
+        return Err(ApiError::bad_request(
+            "INVALID_REQUEST_LIMITS",
+            format!("Too many EVM wallets (max {})", MAX_EVM_WALLETS),
+            Some(json!({
+                "field": "walletAddresses",
+                "max": MAX_EVM_WALLETS,
+                "got": req.wallet_addresses.len()
+            })),
+        ));
+    }
+
+    if req.solana_wallet_addresses.len() > MAX_SOL_WALLETS {
+        return Err(ApiError::bad_request(
+            "INVALID_REQUEST_LIMITS",
+            format!("Too many Solana wallets (max {})", MAX_SOL_WALLETS),
+            Some(json!({
+                "field": "solanaWalletAddresses",
+                "max": MAX_SOL_WALLETS,
+                "got": req.solana_wallet_addresses.len()
+            })),
+        ));
+    }
+
+    if req.contracts.len() > MAX_CONTRACT_GROUPS {
+        return Err(ApiError::bad_request(
+            "INVALID_REQUEST_LIMITS",
+            format!("Too many contract groups (max {})", MAX_CONTRACT_GROUPS),
+            Some(json!({
+                "field": "contracts",
+                "max": MAX_CONTRACT_GROUPS,
+                "got": req.contracts.len()
+            })),
+        ));
+    }
+
+    for cg in &req.contracts {
+        if cg.contract_addresses.len() > MAX_CONTRACTS_PER_GROUP {
+            return Err(ApiError::bad_request(
+                "INVALID_REQUEST_LIMITS",
+                format!(
+                    "Too many contracts in group '{}' (max {})",
+                    cg.network_name, MAX_CONTRACTS_PER_GROUP
+                ),
+                Some(json!({
+                    "field": "contracts[].contractAddresses",
+                    "network": cg.network_name,
+                    "max": MAX_CONTRACTS_PER_GROUP,
+                    "got": cg.contract_addresses.len()
+                })),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+pub fn validate_normalized_request(req: &BalanceRequest) -> Result<(), ApiError> {
+    validate_networks(req)?;
+    validate_evm_wallets(req)?;
+    validate_solana_wallets(req)?;
+    validate_contract_groups(req)?;
+    validate_work_units(req)?;
+    Ok(())
+}
+
+fn validate_networks(req: &BalanceRequest) -> Result<(), ApiError> {
+    let evm = supported_evm_networks();
+    let mut unknown: Vec<String> = vec![];
+
+    for cg in &req.contracts {
+        let n = cg.network_name.as_str();
+        if n == "sol" || n == "trx" {
+            continue;
+        }
+        if !evm.contains_key(n) {
+            unknown.push(cg.network_name.clone());
+        }
+    }
+
+    if !unknown.is_empty() {
+        return Err(ApiError::bad_request(
+            "INVALID_NETWORK",
+            "Unknown network(s) in request",
+            Some(json!({ "unknown": unknown })),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_evm_wallets(req: &BalanceRequest) -> Result<(), ApiError> {
+    for w in &req.wallet_addresses {
+        if !is_valid_evm_h160(w) {
+            return Err(ApiError::bad_request(
+                "INVALID_ADDRESS",
+                "Invalid EVM wallet address",
+                Some(json!({ "wallet": w })),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_solana_wallets(req: &BalanceRequest) -> Result<(), ApiError> {
+    for w in &req.solana_wallet_addresses {
+        if !is_valid_solana_pubkey_32(w) {
+            return Err(ApiError::bad_request(
+                "INVALID_ADDRESS",
+                "Invalid Solana wallet address",
+                Some(json!({ "wallet": w })),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_contract_groups(req: &BalanceRequest) -> Result<(), ApiError> {
+    for cg in &req.contracts {
+        validate_contract_group(cg)?;
+    }
+    Ok(())
+}
+
+fn validate_contract_group(cg: &ContractGroup) -> Result<(), ApiError> {
+    let net = cg.network_name.as_str();
+
+    if net == "sol" {
+        for a in &cg.contract_addresses {
+            if !is_valid_solana_pubkey_32(a) {
+                return Err(ApiError::bad_request(
+                    "INVALID_CONTRACT",
+                    "Invalid Solana mint address",
+                    Some(json!({ "network": net, "contract": a })),
+                ));
+            }
+        }
+        return Ok(());
+    }
+
+    if net == "trx" {
+        return Ok(());
+    }
+
+    for a in &cg.contract_addresses {
+        if !is_valid_evm_h160(a) {
+            return Err(ApiError::bad_request(
+                "INVALID_CONTRACT",
+                "Invalid EVM contract address",
+                Some(json!({ "network": net, "contract": a })),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_work_units(req: &BalanceRequest) -> Result<(), ApiError> {
+    let evm_tokens_total: usize = req
+        .contracts
+        .iter()
+        .filter(|c| {
+            let n = c.network_name.as_str();
+            n != "sol" && n != "trx"
+        })
+        .map(|c| c.contract_addresses.len())
+        .sum();
+
+    let evm_work = req.wallet_addresses.len().saturating_mul(evm_tokens_total);
+    if evm_work > MAX_EVM_WORK_UNITS {
+        return Err(ApiError::bad_request(
+            "INVALID_REQUEST_LIMITS",
+            format!(
+                "EVM request too large (wallets * tokens > {})",
+                MAX_EVM_WORK_UNITS
+            ),
+            Some(json!({
+                "field": "walletAddresses/contracts",
+                "wallets": req.wallet_addresses.len(),
+                "tokens_total": evm_tokens_total,
+                "work_units": evm_work,
+                "max_work_units": MAX_EVM_WORK_UNITS
+            })),
+        ));
+    }
+
+    let sol_contracts_total: usize = req
+        .contracts
+        .iter()
+        .find(|c| c.network_name.as_str() == "sol")
+        .map(|c| c.contract_addresses.len())
+        .unwrap_or(0);
+
+    let sol_work = req
+        .solana_wallet_addresses
+        .len()
+        .saturating_mul(sol_contracts_total);
+
+    if sol_work > MAX_SOL_WORK_UNITS {
+        return Err(ApiError::bad_request(
+            "INVALID_REQUEST_LIMITS",
+            format!(
+                "Solana request too large (wallets * tokens > {})",
+                MAX_SOL_WORK_UNITS
+            ),
+            Some(json!({
+                "field": "solanaWalletAddresses/contracts",
+                "wallets": req.solana_wallet_addresses.len(),
+                "tokens_total": sol_contracts_total,
+                "work_units": sol_work,
+                "max_work_units": MAX_SOL_WORK_UNITS
+            })),
+        ));
+    }
+
+    Ok(())
+}
+
+fn is_valid_evm_h160(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let t = t.strip_prefix("0x").unwrap_or(t);
+    if t.len() != 40 {
+        return false;
+    }
+    t.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn is_valid_solana_pubkey_32(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let decoded = match bs58::decode(t).into_vec() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    decoded.len() == 32
+}
+
+
+==================================================
+FILE: src/main.rs
+==================================================
+
+mod chains;
+mod config;
+mod core;
+mod db;
+mod evm;
+mod http;
+mod solana;
+mod tron;
+mod worker;
+mod queue;
+
+use axum::{
+    routing::{get, post},
+    Router,
+};
+use config::AppConfig;
+use db::mongo::Mongo;
+use std::sync::Arc;
+use tracing_subscriber::EnvFilter;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub cfg: AppConfig,
+    pub mongo: Arc<Mongo>,
+    pub queue: Arc<queue::nats::NatsQueue>,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), anyhow::Error> {
+    dotenvy::dotenv().ok();
+
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .json()
+        .init();
+
+    let cfg = AppConfig::from_env()?;
+    let mongo = Mongo::connect(&cfg).await?;
+
+    let queue = queue::nats::NatsQueue::connect(&cfg).await?;
+    queue.ensure_stream().await?;
+
+    let _ = db::snapshots::ensure_indexes(&mongo.db).await;
+    let _ = db::refresh_jobs::ensure_indexes(&mongo.db).await;
+
+    let state = AppState {
+        cfg: cfg.clone(),
+        mongo: Arc::new(mongo),
+        queue: Arc::new(queue),
+    };
+
+    let worker_state = state.clone();
+    tokio::spawn(async move {
+        worker::runner::run_worker(worker_state).await;
+    });
+
+    let app = Router::new()
+        .route("/health", get(http::handlers::health))
+        .route(
+            "/wallet/get-multi-wallet-balances",
+            post(http::handlers::get_multi_wallet_balances),
+        )
+        .route(
+            "/wallet/status/:request_key",
+            get(http::handlers::get_job_status),
+        )
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;
+    tracing::info!("listening on {}", cfg.bind_addr);
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+
+==================================================
+FILE: src/queue/mod.rs
+==================================================
+
+pub mod nats;
+
+
+==================================================
+FILE: src/queue/nats.rs
+==================================================
+
+use crate::config::AppConfig;
+use anyhow::Context;
+use async_nats::jetstream;
+use async_nats::jetstream::consumer;
+use async_nats::jetstream::stream::{RetentionPolicy, StorageType};
+use async_nats::{Client, HeaderMap};
+use std::time::Duration;
+
+/// Durable work-queue of `requestKey` jobs.
+/// Mongo remains the source of truth for status/dedup; JetStream is delivery.
+#[derive(Clone)]
+pub struct NatsQueue {
+    client: Client,
+    js: jetstream::Context,
+    stream: String,
+    subject: String,
+    durable: String,
+    max_ack_pending: i64,
+    ack_wait: Duration,
+}
+
+impl NatsQueue {
+    pub async fn connect(cfg: &AppConfig) -> Result<Self, anyhow::Error> {
+        let client = async_nats::connect(&cfg.nats_url)
+            .await
+            .with_context(|| format!("connect nats: {}", cfg.nats_url))?;
+        let js = jetstream::new(client.clone());
+
+        Ok(Self {
+            client,
+            js,
+            stream: cfg.nats_stream.clone(),
+            subject: cfg.nats_subject.clone(),
+            durable: cfg.nats_durable.clone(),
+            max_ack_pending: cfg.nats_max_ack_pending,
+            ack_wait: Duration::from_secs(cfg.nats_ack_wait_secs),
+        })
+    }
+
+    pub async fn ensure_stream(&self) -> Result<(), anyhow::Error> {
+        if self.js.get_stream(&self.stream).await.is_ok() {
+            return Ok(());
+        }
+
+        self.js
+            .create_stream(jetstream::stream::Config {
+                name: self.stream.clone(),
+                subjects: vec![self.subject.clone()],
+                retention: RetentionPolicy::WorkQueue,
+                storage: StorageType::File,
+                // NOTE: max_ack_pending is NOT a stream config field in async-nats 0.46.
+                // It belongs on the consumer config (see get_or_create_consumer).
+                max_age: Duration::from_secs(60 * 60 * 24 * 7),
+                ..Default::default()
+            })
+            .await
+            .with_context(|| format!("create stream {}", self.stream))?;
+
+        Ok(())
+    }
+
+    pub async fn publish(&self, request_key: &str) -> Result<(), anyhow::Error> {
+        let mut headers = HeaderMap::new();
+        // NATS expects a header value type like &str/String, not parse().
+        headers.insert("Nats-Msg-Id", request_key.to_string());
+
+        self.client
+            .publish_with_headers(
+                self.subject.clone(),
+                headers,
+                request_key.as_bytes().to_vec().into(),
+            )
+            .await
+            .context("publish job")?;
+
+        Ok(())
+    }
+
+    pub async fn get_or_create_consumer(&self) -> Result<consumer::PullConsumer, anyhow::Error> {
+        let stream = self
+            .js
+            .get_stream(&self.stream)
+            .await
+            .with_context(|| format!("get stream {}", self.stream))?;
+
+        if let Ok(c) = stream.get_consumer(&self.durable).await {
+            return Ok(c);
+        }
+
+        let cfg = consumer::pull::Config {
+            durable_name: Some(self.durable.clone()),
+            ack_policy: consumer::AckPolicy::Explicit,
+            ack_wait: self.ack_wait,
+            max_ack_pending: self.max_ack_pending,
+            ..Default::default()
+        };
+
+        let consumer = stream
+            .create_consumer(cfg)
+            .await
+            .with_context(|| format!("create consumer {}", self.durable))?;
+
+        Ok(consumer)
+    }
+}
+
+
+==================================================
+FILE: src/solana/mod.rs
+==================================================
+
+pub mod rpc;
+
+
+
+==================================================
+FILE: src/solana/rpc.rs
+==================================================
+
+use anyhow::anyhow;
+use reqwest::Client;
+use serde_json::json;
+use std::time::Duration;
+
+#[derive(Clone)]
+pub struct SolanaRpcClient {
+    http: Client,
+    rpc_url: String,
+}
+
+impl SolanaRpcClient {
+    pub fn new(rpc_url: String, timeout_ms: u64) -> Self {
+        let http = Client::builder()
+            .timeout(Duration::from_millis(timeout_ms))
+            .build()
+            .expect("failed to build reqwest client");
+
+        Self { http, rpc_url }
+    }
+
+    pub async fn get_balance_lamports(&self, pubkey: &str) -> Result<u64, anyhow::Error> {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBalance",
+            "params": [ pubkey ]
+        });
+
+        let res = self.http.post(&self.rpc_url).json(&payload).send().await?;
+        let status = res.status();
+        let v: serde_json::Value = res.json().await?;
+
+        if !status.is_success() {
+            return Err(anyhow!("sol rpc http error: status={} body={}", status, v));
+        }
+        if let Some(err) = v.get("error") {
+            return Err(anyhow!("sol rpc error: {}", err));
+        }
+
+        let lamports = v
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(|x| x.as_u64())
+            .ok_or_else(|| anyhow!("missing sol getBalance result.value: {}", v))?;
+
+        Ok(lamports)
+    }
+
+    /// Fetch SPL token balance for (owner, mint) without computing ATA:
+    /// Uses `getTokenAccountsByOwner` with mint filter and jsonParsed encoding.
+    ///
+    /// Returns: (amount_base_units_u128, decimals_u32)
+    pub async fn get_spl_balance_by_owner_mint(
+        &self,
+        owner_pubkey: &str,
+        mint_pubkey: &str,
+    ) -> Result<(u128, u32), anyhow::Error> {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenAccountsByOwner",
+            "params": [
+                owner_pubkey,
+                { "mint": mint_pubkey },
+                { "encoding": "jsonParsed" }
+            ]
+        });
+
+        let res = self.http.post(&self.rpc_url).json(&payload).send().await?;
+        let status = res.status();
+        let v: serde_json::Value = res.json().await?;
+
+        if !status.is_success() {
+            return Err(anyhow!(
+                "sol rpc http error (getTokenAccountsByOwner): status={} body={}",
+                status,
+                v
+            ));
+        }
+        if let Some(err) = v.get("error") {
+            return Err(anyhow!("sol rpc error (getTokenAccountsByOwner): {}", err));
+        }
+
+        let arr = v
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(|x| x.as_array())
+            .ok_or_else(|| anyhow!("missing sol result.value array: {}", v))?;
+
+        if arr.is_empty() {
+            // token account not found => 0
+            return Ok((0u128, 0u32)); // decimals unknown; caller should handle
+        }
+
+        // Take first token account (usually ATA, but could be multiple)
+        let token_amount = arr[0]
+            .get("account")
+            .and_then(|a| a.get("data"))
+            .and_then(|d| d.get("parsed"))
+            .and_then(|p| p.get("info"))
+            .and_then(|i| i.get("tokenAmount"))
+            .ok_or_else(|| anyhow!("missing parsed.info.tokenAmount: {}", v))?;
+
+        let amount_str = token_amount
+            .get("amount")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| anyhow!("missing tokenAmount.amount: {}", v))?;
+
+        let decimals = token_amount
+            .get("decimals")
+            .and_then(|x| x.as_u64())
+            .ok_or_else(|| anyhow!("missing tokenAmount.decimals: {}", v))?
+            as u32;
+
+        let amount_u128: u128 = amount_str
+            .parse::<u128>()
+            .map_err(|e| anyhow!("invalid token amount '{}': {}", amount_str, e))?;
+
+        Ok((amount_u128, decimals))
+    }
+}
+
+
+
+==================================================
+FILE: src/tests/Cargo.toml
+==================================================
+
+[package]
+name = "tests"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+
+
+==================================================
+FILE: src/tests/mod.rs
+==================================================
+
+
+
+
+==================================================
+FILE: src/tests/src/main.rs
+==================================================
+
+fn main() {
+    println!("Hello, world!");
+}
+
+
+
+==================================================
+FILE: src/tron/mod.rs
+==================================================
+
+pub mod rpc;
+
+
+
+==================================================
+FILE: src/tron/rpc.rs
+==================================================
+
+// ==================================================
+// balance-service\src\tron\rpc.rs
+// ==================================================
+
+use anyhow::anyhow;
+use base64::{engine::general_purpose, Engine as _};
+use ethabi::{Function, Param, ParamType, StateMutability, Token};
+use reqwest::Client;
+use serde_json::{json, Value};
+use std::time::Duration;
+
+#[derive(Clone)]
+pub struct TronRpcClient {
+    http: Client,
+    fullnode_url: String,
+    solidity_url: String,
+    api_key: Option<String>,
+}
+
+impl TronRpcClient {
+    pub fn new(
+        fullnode_url: String,
+        solidity_url: String,
+        api_key: Option<String>,
+        timeout_ms: u64,
+    ) -> Self {
+        let http = Client::builder()
+            .timeout(Duration::from_millis(timeout_ms))
+            .user_agent("balance-service/1.0 (tron)")
+            .build()
+            .expect("failed to build reqwest client");
+
+        Self {
+            http,
+            fullnode_url: fullnode_url.trim_end_matches('/').to_string(),
+            solidity_url: solidity_url.trim_end_matches('/').to_string(),
+            api_key,
+        }
+    }
+
+    // ---------------- low-level HTTP ----------------
+
+    fn post(&self, url: &str, payload: &Value) -> reqwest::RequestBuilder {
+        let mut rb = self.http.post(url).json(payload);
+        if let Some(k) = &self.api_key {
+            // TRON gateway header used by many providers (incl. TronGrid style)
+            rb = rb.header("TRON-PRO-API-KEY", k);
+        }
+        rb
+    }
+
+    async fn post_json(&self, url: &str, payload: &Value) -> Result<Value, anyhow::Error> {
+        let res = self.post(url, payload).send().await?;
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+
+        if !status.is_success() {
+            return Err(anyhow!(
+                "TRON HTTP error {} @ {} | body={}",
+                status,
+                url,
+                text.chars().take(600).collect::<String>()
+            ));
+        }
+
+        let v: Value = serde_json::from_str(&text).map_err(|e| {
+            anyhow!(
+                "TRON JSON decode failed @ {}: {} | body={}",
+                url,
+                e,
+                text.chars().take(600).collect::<String>()
+            )
+        })?;
+
+        Ok(v)
+    }
+
+    // ---------------- ABI helpers ----------------
+
+    #[allow(deprecated)]
+    fn fn_decimals() -> Function {
+        Function {
+            name: "decimals".to_string(),
+            inputs: vec![],
+            outputs: vec![Param {
+                name: "decimals".to_string(),
+                kind: ParamType::Uint(8),
+                internal_type: None,
+            }],
+            constant: None,
+            state_mutability: StateMutability::View,
+        }
+    }
+
+    #[allow(deprecated)]
+    fn fn_balance_of() -> Function {
+        Function {
+            name: "balanceOf".to_string(),
+            inputs: vec![Param {
+                name: "account".to_string(),
+                kind: ParamType::Address,
+                internal_type: None,
+            }],
+            outputs: vec![Param {
+                name: "balance".to_string(),
+                kind: ParamType::Uint(256),
+                internal_type: None,
+            }],
+            constant: None,
+            state_mutability: StateMutability::View,
+        }
+    }
+
+    // ---------------- address utils ----------------
+
+    /// Decode TRON base58check (T...) -> hex payload "41" + 20 bytes (21 bytes total) as lowercase hex string.
+    pub fn tron_base58_to_hex41(addr_b58: &str) -> Result<String, anyhow::Error> {
+        use sha2::{Digest, Sha256};
+
+        let t = addr_b58.trim();
+        if t.is_empty() {
+            return Err(anyhow!("empty tron address"));
+        }
+
+        let decoded = bs58::decode(t).into_vec()?;
+        if decoded.len() != 25 {
+            return Err(anyhow!("invalid tron base58 length: {}", decoded.len()));
+        }
+
+        let (payload, checksum) = decoded.split_at(21);
+
+        // checksum = first 4 bytes of sha256d(payload)
+        let h1 = Sha256::digest(payload);
+        let h2 = Sha256::digest(&h1);
+
+        if checksum != &h2[..4] {
+            return Err(anyhow!("invalid tron checksum"));
+        }
+
+        // payload[0] is 0x41 for mainnet
+        Ok(hex::encode(payload))
+    }
+
+    /// Convert EVM 0x + 20 bytes to TRON base58check address (starts with T)
+    pub fn evm_hex_to_tron_base58(evm: &str) -> Result<String, anyhow::Error> {
+        use sha2::{Digest, Sha256};
+
+        let hex20 = evm.trim().strip_prefix("0x").unwrap_or(evm.trim());
+        if hex20.len() != 40 {
+            return Err(anyhow!(
+                "invalid evm address len (expected 40 hex chars): {}",
+                hex20.len()
+            ));
+        }
+
+        let addr20 = hex::decode(hex20)?;
+        if addr20.len() != 20 {
+            return Err(anyhow!("invalid evm address bytes len: {}", addr20.len()));
+        }
+
+        // TRON payload = 0x41 + 20 bytes
+        let mut payload = Vec::with_capacity(21);
+        payload.push(0x41);
+        payload.extend_from_slice(&addr20);
+
+        // checksum
+        let h1 = Sha256::digest(&payload);
+        let h2 = Sha256::digest(&h1);
+
+        let mut out = Vec::with_capacity(25);
+        out.extend_from_slice(&payload);
+        out.extend_from_slice(&h2[..4]);
+
+        Ok(bs58::encode(out).into_string())
+    }
+
+    // ---------------- constant_result decode ----------------
+
+    /// Decodes constant_result which can be:
+    /// 1. Hex string (standard)
+    /// 2. Base64 string (TronGrid / some GetBlock nodes)
+    fn decode_constant_result(raw: &str) -> Result<Vec<u8>, anyhow::Error> {
+        let s = raw.trim();
+        if s.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // 1. Try Hex first
+        let clean_hex = s.strip_prefix("0x").unwrap_or(s);
+        // Basic filter: if it contains non-hex chars, it's definitely not hex (or it's broken hex)
+        if clean_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            // Handle odd-length hex if necessary
+            let hex_input = if clean_hex.len() % 2 != 0 {
+                format!("0{}", clean_hex)
+            } else {
+                clean_hex.to_string()
+            };
+
+            if let Ok(bytes) = hex::decode(&hex_input) {
+                return Ok(bytes);
+            }
+        }
+
+        // 2. Fallback to Base64
+        match general_purpose::STANDARD.decode(s) {
+            Ok(bytes) => {
+                tracing::debug!(len = bytes.len(), "decoded constant_result via Base64");
+                Ok(bytes)
+            }
+            Err(_) => {
+                // Return generic error if both fail
+                Err(anyhow!(
+                    "constant_result is neither valid Hex nor Base64: {}",
+                    s
+                ))
+            }
+        }
+    }
+
+    fn extract_constant_result(v: &Value) -> Result<Vec<u8>, anyhow::Error> {
+        // Typical response:
+        // { "result": { "result": true }, "constant_result": ["..."], ... }
+        // If revert/blocked: constant_result may be empty or missing.
+        let ok = v
+            .get("result")
+            .and_then(|r| r.get("result"))
+            .and_then(|x| x.as_bool());
+
+        if ok == Some(false) {
+            // some providers include message/code fields
+            return Ok(vec![]);
+        }
+
+        // Make it a slice so we can safely default with &[]
+        let arr: &[Value] = v
+            .get("constant_result")
+            .and_then(|x| x.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or(&[]);
+
+        if arr.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let raw0 = arr[0]
+            .as_str()
+            .ok_or_else(|| anyhow!("constant_result[0] not string: {}", v))?;
+
+        Self::decode_constant_result(raw0)
+    }
+
+    // ---------------- core TRON call ----------------
+
+    async fn trigger_constant(
+        &self,
+        contract_b58: &str,
+        owner_b58: &str,
+        function_selector: &str,
+        parameter_hex: &str,
+    ) -> Result<Vec<u8>, anyhow::Error> {
+        // Determine correct endpoint based on configured URLs.
+        // If a solidity URL is provided, we MUST use `/walletsolidity/`.
+        // If only fullnode URL is provided, we use `/wallet/`.
+        let (base_url, use_solidity) = if !self.solidity_url.is_empty() {
+            (&self.solidity_url, true)
+        } else {
+            (&self.fullnode_url, false)
+        };
+
+        // Fix: Use correct path segment to avoid 405 Method Not Allowed
+        let path_segment = if use_solidity {
+            "walletsolidity"
+        } else {
+            "wallet"
+        };
+        let url = format!("{}/{}/triggerconstantcontract", base_url, path_segment);
+
+        let payload = json!({
+            "owner_address": owner_b58,
+            "contract_address": contract_b58,
+            "function_selector": function_selector,
+            "parameter": parameter_hex, // hex-encoded ABI args ONLY, no 0x
+            "visible": true
+        });
+
+        tracing::debug!(
+            url = %url,
+            function = %function_selector,
+            contract = %contract_b58,
+            owner = %owner_b58,
+            param_len = parameter_hex.len(),
+            "TRON triggerconstantcontract → sending"
+        );
+
+        let v = self.post_json(&url, &payload).await?;
+
+        // TRON can still return 200 with { result: { result:false }, ... }
+        // We treat that as empty (caller falls back to zero/default).
+        let out = Self::extract_constant_result(&v)?;
+
+        tracing::debug!(
+            function = %function_selector,
+            contract = %contract_b58,
+            out_len = out.len(),
+            "TRON triggerconstantcontract ← parsed"
+        );
+
+        Ok(out)
+    }
+
+    // ---------------- public API ----------------
+
+    /// Native TRX balance in SUN (1 TRX = 1_000_000 SUN)
+    pub async fn get_trx_balance_sun(&self, wallet_b58: &str) -> Result<u64, anyhow::Error> {
+        let url = format!("{}/wallet/getaccount", self.fullnode_url);
+        let payload = json!({ "address": wallet_b58, "visible": true });
+
+        tracing::debug!(wallet=%wallet_b58, "TRON getaccount → sending");
+
+        let v = self.post_json(&url, &payload).await?;
+
+        // If account doesn't exist yet, getaccount may return {} or missing fields.
+        let bal = v.get("balance").and_then(|x| x.as_u64()).unwrap_or(0);
+
+        tracing::debug!(wallet=%wallet_b58, balance_sun=bal, "TRON getaccount ← parsed");
+
+        Ok(bal)
+    }
+
+    pub async fn get_trc20_decimals(
+        &self,
+        contract_b58: &str,
+        owner_b58: &str,
+    ) -> Result<u32, anyhow::Error> {
+        // NOTE: Some nodes require owner to be a real account; but most accept any valid address.
+        let f = Self::fn_decimals();
+        let out = self
+            .trigger_constant(contract_b58, owner_b58, "decimals()", "")
+            .await?;
+
+        if out.is_empty() {
+            // safest fallback (most ERC20s / TRC20s are 18)
+            return Ok(18);
+        }
+
+        let decoded = f.decode_output(&out)?;
+        let dec = decoded.get(0).and_then(|t| match t {
+            Token::Uint(u) => Some(u.as_u32()),
+            _ => None,
+        });
+
+        Ok(dec.unwrap_or(18))
+    }
+
+    /// TRC20 balance in base units (raw integer)
+    pub async fn get_trc20_balance(
+        &self,
+        contract_b58: &str,
+        owner_b58: &str,
+    ) -> Result<u128, anyhow::Error> {
+        // Keep ABI definition for decoding the OUTPUT only
+        let f = Self::fn_balance_of();
+
+        // ---------------------------------------------------------
+        // FIX: Manually encode input to include the 0x41 TRON byte.
+        // ethabi::Token::Address forces 20 bytes, stripping 0x41.
+        // We need: [11 bytes padding] + [0x41] + [20 bytes address]
+        // ---------------------------------------------------------
+
+        // 1. Get the 21-byte hex string (e.g., "41..." + 40 chars)
+        let addr_hex_41 = Self::tron_base58_to_hex41(owner_b58)?;
+
+        // 2. Pad to 32 bytes (64 hex characters).
+        //    21 bytes = 42 chars.
+        //    32 bytes = 64 chars.
+        //    64 - 42 = 22 characters of zero padding needed.
+        let param_hex = format!("{}{}", "0".repeat(22), addr_hex_41);
+
+        let out = self
+            .trigger_constant(contract_b58, owner_b58, "balanceOf(address)", &param_hex)
+            .await?;
+
+        if out.is_empty() {
+            return Ok(0);
+        }
+
+        let decoded = f.decode_output(&out)?;
+        let u = match decoded.get(0) {
+            Some(Token::Uint(v)) => v.clone(),
+            _ => {
+                return Err(anyhow!("invalid TRC20 balanceOf decode"));
+            }
+        };
+
+        // Convert U256 -> u128 safely
+        let mut buf = [0u8; 32];
+        u.to_big_endian(&mut buf);
+        Ok(u128::from_be_bytes(
+            buf[16..].try_into().expect("slice len checked"),
+        ))
+    }
+}
+
+
+
+==================================================
+FILE: src/worker/mod.rs
+==================================================
+
+pub mod runner;
+
+
+
+==================================================
+FILE: src/worker/runner.rs
+==================================================
+
+use crate::AppState;
+use anyhow::anyhow;
+use bson::{doc, DateTime};
+use futures::stream::{self, StreamExt};
+use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
+use serde_json::json;
+use tokio::time::Duration;
+
+use crate::chains::{is_ignored_network, supported_evm_networks};
+use crate::core::normalize::normalize_request;
+use crate::evm::format::u256_to_decimal_string;
+use crate::evm::multicall3::{
+    fetch_balances_multicall3, fetch_token_decimals_multicall3, EvmBalances,
+};
+use crate::evm::rpc::RpcClient;
+use crate::http::dto::{zero_result_from_request, BalanceRequest};
+use crate::solana::rpc::SolanaRpcClient;
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+const MAX_CALLS_PER_BATCH: usize = 600;
+
+const NATIVE_DECIMALS: u32 = 18;
+const SOL_DECIMALS: u32 = 9;
+
+// --- metrics ---
+static JOBS_CLAIMED: AtomicU64 = AtomicU64::new(0);
+static JOBS_DONE: AtomicU64 = AtomicU64::new(0);
+static JOBS_FAILED: AtomicU64 = AtomicU64::new(0);
+
+static EVM_NET_OK: AtomicU64 = AtomicU64::new(0);
+static EVM_NET_FAIL: AtomicU64 = AtomicU64::new(0);
+
+static SOL_NET_OK: AtomicU64 = AtomicU64::new(0);
+static SOL_NET_FAIL: AtomicU64 = AtomicU64::new(0);
+
+fn is_valid_solana_pubkey_32(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let decoded = match bs58::decode(t).into_vec() {
+        Ok(v) => v,
+        Err(_) => {
+            return false;
+        }
+    };
+    decoded.len() == 32
+}
+
+fn native_symbol_for(network: &str) -> &str {
+    match network {
+        "eth" => "eth",
+        "bnb" => "bnb",
+        "matic" => "matic",
+        "op" => "op",
+        _ => network,
+    }
+}
+
+fn u128_base_units_to_fixed_18(value: u128, decimals: u32) -> String {
+    if decimals == 0 {
+        return format!("{}.{}", value, "0".repeat(18));
+    }
+
+    let out_decimals: u32 = 18;
+    let pow = (10u128).checked_pow(decimals.min(38)).unwrap_or(u128::MAX);
+
+    if pow == u128::MAX && decimals > 38 {
+        return format!("0.{}", "0".repeat(18));
+    }
+
+    let whole = if pow == 0 { 0 } else { value / pow };
+    let frac = if pow == 0 { 0 } else { value % pow };
+    let mut frac_str = frac.to_string();
+    let dec_usize = decimals as usize;
+
+    if frac_str.len() < dec_usize {
+        frac_str = format!("{}{}", "0".repeat(dec_usize - frac_str.len()), frac_str);
+    }
+
+    if out_decimals > decimals {
+        frac_str.push_str(&"0".repeat((out_decimals - decimals) as usize));
+    } else if out_decimals < decimals {
+        frac_str.truncate(out_decimals as usize);
+    }
+
+    format!("{}.{}", whole, frac_str)
+}
+
+fn lamports_u128_to_sol_fixed_18(lamports: u128) -> String {
+    u128_base_units_to_fixed_18(lamports, SOL_DECIMALS)
+}
+
+fn sol_mints_from_request(req: &BalanceRequest) -> Vec<String> {
+    req.contracts
+        .iter()
+        .find(|c| c.network_name == "sol")
+        .map(|c| c.contract_addresses.clone())
+        .unwrap_or_default()
+}
+
+pub async fn run_worker(state: AppState) {
+    let worker_pool = state.cfg.worker_concurrency.max(1) as usize;
+    tracing::info!(
+        worker_enabled = state.cfg.worker_enabled,
+        worker_pool = worker_pool,
+        "worker started"
+    );
+
+    if state.cfg.nats_url.trim().is_empty() {
+        tracing::warn!("NATS_URL is empty; falling back to Mongo scan loop");
+        run_worker_mongo_fallback(state).await;
+        return;
+    }
+
+    let queue = state.queue.clone();
+    if let Err(e) = queue.ensure_stream().await {
+        tracing::error!(error = %e, "failed to ensure JetStream stream; falling back to Mongo scan loop");
+        run_worker_mongo_fallback(state).await;
+        return;
+    }
+
+    let consumer = match queue.get_or_create_consumer().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to get/create JetStream consumer; falling back to Mongo scan loop");
+            run_worker_mongo_fallback(state).await;
+            return;
+        }
+    };
+
+    loop {
+        if !state.cfg.worker_enabled {
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            continue;
+        }
+
+        let poll_ms = state.cfg.worker_poll_ms.max(50);
+        
+        let mut batch_stream = match consumer.fetch().max_messages(32).messages().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "JetStream fetch failed; sleeping 1000ms");
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                continue;
+            }
+        };
+
+        let mut fetched = Vec::new();
+        while let Some(msg_result) = batch_stream.next().await {
+            if let Ok(msg) = msg_result {
+                fetched.push(msg);
+            }
+        }
+
+        if fetched.is_empty() {
+            tokio::time::sleep(Duration::from_millis(poll_ms)).await;
+            continue;
+        }
+
+        let state_ref = &state;
+        stream::iter(fetched)
+            .for_each_concurrent(worker_pool, |msg| async move {
+                let request_key = match std::str::from_utf8(msg.payload.as_ref()) {
+                    Ok(k) => k.trim().to_string(),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "dropping message: cannot decode requestKey");
+                        let _ = msg.ack().await;
+                        return;
+                    }
+                };
+
+                async fn claim_job_by_key(state: &AppState, request_key: &str) -> Result<bool, mongodb::error::Error> {
+                    let coll = state.mongo.db.collection::<bson::Document>("balance_refresh_jobs");
+                    let now = DateTime::now();
+                    let filter = doc! {
+                        "requestKey": request_key,
+                        "status": "queued",
+                        "$or": [
+                            { "nextRetryAt": bson::Bson::Null },
+                            { "nextRetryAt": { "$lte": now } }
+                        ]
+                    };
+                    let update = doc! { "$set": { "status": "running", "updatedAt": now } };
+                    let opts = FindOneAndUpdateOptions::builder().return_document(ReturnDocument::After).build();
+                    let doc_opt = coll.find_one_and_update(filter, update).with_options(opts).await?;
+                    Ok(doc_opt.is_some())
+                }
+
+                match claim_job_by_key(state_ref, &request_key).await {
+                    Ok(true) => {
+                        JOBS_CLAIMED.fetch_add(1, Ordering::Relaxed);
+                        tracing::info!(request_key = %request_key, "claimed job");
+
+                        let job_start = Instant::now();
+                        let res = process_job(state_ref, &request_key).await;
+
+                        match res {
+                            Ok(_) => {
+                                JOBS_DONE.fetch_add(1, Ordering::Relaxed);
+                                tracing::info!(
+                                    request_key = %request_key,
+                                    elapsed_ms = job_start.elapsed().as_millis(),
+                                    "job done"
+                                );
+                                let _ = msg.ack().await;
+                            }
+                            Err(e) => {
+                                JOBS_FAILED.fetch_add(1, Ordering::Relaxed);
+                                tracing::error!(
+                                    request_key = %request_key,
+                                    elapsed_ms = job_start.elapsed().as_millis(),
+                                    error = %e,
+                                    "job failed"
+                                );
+                                let _ = mark_job_failed(state_ref, &request_key).await;
+                                let _ = msg.ack_with(async_nats::jetstream::AckKind::Nak(None)).await;
+                            }
+                        }
+                    }
+                    Ok(false) => {
+                        let _ = msg.ack().await;
+                    }
+                    Err(e) => {
+                        tracing::error!(request_key=%request_key, error=%e, "failed to claim job in Mongo");
+                        let _ = msg.ack_with(async_nats::jetstream::AckKind::Nak(None)).await;
+                    }
+                }
+            })
+            .await;
+    }
+}
+
+async fn run_worker_mongo_fallback(state: AppState) {
+    let poll_ms = state.cfg.worker_poll_ms;
+    tracing::info!(
+        worker_enabled = state.cfg.worker_enabled,
+        poll_ms = poll_ms,
+        "worker mongo fallback started"
+    );
+
+    loop {
+        if !state.cfg.worker_enabled {
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            continue;
+        }
+
+        match claim_next_job(&state).await {
+            Ok(Some(request_key)) => {
+                JOBS_CLAIMED.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(request_key = %request_key, "claimed job (mongo)");
+
+                let job_start = Instant::now();
+                let res = process_job(&state, &request_key).await;
+
+                match res {
+                    Ok(_) => {
+                        JOBS_DONE.fetch_add(1, Ordering::Relaxed);
+                        tracing::info!(
+                            request_key = %request_key,
+                            elapsed_ms = job_start.elapsed().as_millis(),
+                            "job done (mongo)"
+                        );
+                    }
+                    Err(e) => {
+                        JOBS_FAILED.fetch_add(1, Ordering::Relaxed);
+                        tracing::error!(
+                            request_key = %request_key,
+                            elapsed_ms = job_start.elapsed().as_millis(),
+                            error = %e,
+                            "job failed (mongo)"
+                        );
+                        let _ = mark_job_failed(&state, &request_key).await;
+                    }
+                }
+            }
+            Ok(None) => {
+                tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "worker claim error -> sleeping 1000ms");
+                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            }
+        }
+    }
+}
+
+async fn claim_next_job(state: &AppState) -> Result<Option<String>, mongodb::error::Error> {
+    let coll = state.mongo.db.collection::<bson::Document>("balance_refresh_jobs");
+    let now = DateTime::now();
+
+    let filter = doc! {
+        "status": "queued",
+        "$or": [
+            { "nextRetryAt": bson::Bson::Null },
+            { "nextRetryAt": { "$lte": now } }
+        ]
+    };
+
+    let update = doc! {
+        "$set": { "status": "running", "updatedAt": now }
+    };
+
+    let opts = FindOneAndUpdateOptions::builder()
+        .sort(doc! { "createdAt": 1 })
+        .return_document(ReturnDocument::After)
+        .build();
+
+    let doc_opt = coll.find_one_and_update(filter, update).with_options(opts).await?;
+    Ok(doc_opt.and_then(|d| d.get_str("requestKey").ok().map(|s| s.to_string())))
+}
+
+async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::Error> {
+    let snapshots = state.mongo.db.collection::<bson::Document>("balance_snapshots");
+    let now = DateTime::now();
+
+    snapshots.update_one(
+        doc! { "requestKey": request_key },
+        doc! { "$set": { "refreshState": "running", "isComplete": false } },
+    ).await?;
+
+    let snap = snapshots.find_one(doc! { "requestKey": request_key }).await?
+        .ok_or_else(|| anyhow!("snapshot not found for requestKey"))?;
+
+    let initial_result_json: serde_json::Value = snap
+        .get("result")
+        .cloned()
+        .and_then(|b| bson::from_bson(b).ok())
+        .unwrap_or(json!({}));
+
+    let normalized_req_bson = snap
+        .get("normalizedRequest")
+        .cloned()
+        .unwrap_or(bson::Bson::Null);
+
+    let normalized_req_json: serde_json::Value =
+        bson::from_bson(normalized_req_bson).unwrap_or_else(|_| json!({}));
+
+    let req_raw: BalanceRequest = serde_json::from_value(normalized_req_json.clone())
+        .unwrap_or_else(|_| BalanceRequest {
+            hard_refresh: false,
+            contracts: vec![],
+            wallet_addresses: vec![],
+            solana_wallet_addresses: vec![],
+            tron_wallet_addresses: vec![],
+            doge_wallet_addresses: vec![],
+            btc_wallet_addresses: vec![],
+        });
+
+    let req: BalanceRequest = normalize_request(&req_raw);
+    let req_sanitized_json = serde_json::to_value(&req).unwrap_or_else(|_| json!({}));
+    let mut final_result = zero_result_from_request(&req);
+
+    if let Some(existing_bson) = snap.get("result") {
+        if existing_bson != &bson::Bson::Null {
+            if let Ok(existing_json) = bson::from_bson::<serde_json::Value>(existing_bson.clone()) {
+                final_result = existing_json;
+            }
+        }
+    }
+
+    let evm_wallet_index: std::collections::HashMap<String, usize> = req
+        .wallet_addresses
+        .iter()
+        .enumerate()
+        .map(|(i, w)| (w.clone(), i))
+        .collect();
+
+    let sol_offset = req.wallet_addresses.len();
+    let sol_wallet_index: std::collections::HashMap<String, usize> = req
+        .solana_wallet_addresses
+        .iter()
+        .enumerate()
+        .map(|(i, w)| (w.clone(), sol_offset + i))
+        .collect();
+
+    // ==========================
+    // EVM processing
+    // ==========================
+    let evm_map = supported_evm_networks();
+
+    for cg in &req.contracts {
+        let net = cg.network_name.as_str();
+
+        if net == "sol" || net == "trx" {
+            continue;
+        }
+
+        if is_ignored_network(net) {
+            tracing::warn!(network = %net, "ignored network in contracts list");
+            continue;
+        }
+
+        let Some(chain) = evm_map.get(net).copied() else {
+            tracing::warn!(network = %net, "unsupported network in contracts list (ignored)");
+            continue;
+        };
+
+        let net_start = Instant::now();
+
+        let rpc_url = chain.thirdweb_rpc_url(&state.cfg.thirdweb_client_id);
+        let rpc = RpcClient::new(rpc_url, state.cfg.rpc_timeout_ms);
+
+        let balances: EvmBalances = match fetch_balances_multicall3(
+            &rpc,
+            &req.wallet_addresses,
+            &cg.contract_addresses,
+            MAX_CALLS_PER_BATCH,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                EVM_NET_FAIL.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    network = %net,
+                    error = %e,
+                    elapsed_ms = net_start.elapsed().as_millis(),
+                    evm_ok = EVM_NET_OK.load(Ordering::Relaxed),
+                    evm_fail = EVM_NET_FAIL.load(Ordering::Relaxed),
+                    "evm fetch failed -> keeping previous val or zeros"
+                );
+                continue;
+            }
+        };
+
+        let decimals_map = match fetch_token_decimals_multicall3(
+            &rpc,
+            &cg.contract_addresses,
+            MAX_CALLS_PER_BATCH,
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!(network = %net, error = %e, "decimals fetch failed -> default 18");
+                std::collections::HashMap::new()
+            }
+        };
+
+        for w in &req.wallet_addresses {
+            let row_idx = *evm_wallet_index
+                .get(w)
+                .ok_or_else(|| anyhow!("evm wallet index missing"))?;
+
+            let data_arr = final_result
+                .get_mut("data")
+                .and_then(|v| v.as_array_mut())
+                .ok_or_else(|| anyhow!("final_result.data missing or not array"))?;
+
+            let row = data_arr
+                .get_mut(row_idx)
+                .ok_or_else(|| anyhow!("wallet row missing"))?;
+
+            let bal_obj = row
+                .get_mut("balance")
+                .and_then(|v| v.as_object_mut())
+                .ok_or_else(|| anyhow!("balance field not an object"))?;
+
+            if !bal_obj.contains_key(net) {
+                bal_obj.insert(net.to_string(), json!({}));
+            }
+            let chain_obj = bal_obj
+                .get_mut(net)
+                .and_then(|v| v.as_object_mut())
+                .ok_or_else(|| anyhow!("balance.{net} missing or not object"))?;
+
+            let native_wei = balances.native.get(w).cloned().unwrap_or_default();
+            let native_str = u256_to_decimal_string(native_wei, NATIVE_DECIMALS, false);
+            chain_obj.insert(native_symbol_for(net).to_string(), json!(native_str));
+
+            for token_addr in &cg.contract_addresses {
+                let raw_bal = balances
+                    .erc20
+                    .get(w)
+                    .and_then(|m| m.get(token_addr))
+                    .cloned()
+                    .unwrap_or_default();
+
+                let dec = decimals_map.get(token_addr).cloned().unwrap_or(18);
+                let s = u256_to_decimal_string(raw_bal, dec, false);
+
+                chain_obj.insert(token_addr.clone(), json!(s));
+            }
+        }
+
+        let mut native_sum = ethereum_types::U256::zero();
+        for w in &req.wallet_addresses {
+            native_sum += balances.native.get(w).cloned().unwrap_or_default();
+        }
+
+        let totals_balance_obj = final_result
+            .get_mut("total")
+            .and_then(|v| v.as_object_mut())
+            .and_then(|m| m.get_mut("balance"))
+            .and_then(|v| v.as_object_mut())
+            .ok_or_else(|| anyhow!("final_result.total.balance missing or not object"))?;
+
+        if !totals_balance_obj.contains_key(net) {
+            totals_balance_obj.insert(net.to_string(), json!({}));
+        }
+
+        let total_chain_obj = totals_balance_obj
+            .get_mut(net)
+            .and_then(|v| v.as_object_mut())
+            .ok_or_else(|| anyhow!("total.balance.{net} missing or not object"))?;
+
+        total_chain_obj.insert(
+            native_symbol_for(net).to_string(),
+            json!(u256_to_decimal_string(native_sum, NATIVE_DECIMALS, false)),
+        );
+
+        for token_addr in &cg.contract_addresses {
+            let mut sum = ethereum_types::U256::zero();
+            for w in &req.wallet_addresses {
+                let v = balances
+                    .erc20
+                    .get(w)
+                    .and_then(|m| m.get(token_addr))
+                    .cloned()
+                    .unwrap_or_default();
+                sum += v;
+            }
+
+            let dec = decimals_map.get(token_addr).cloned().unwrap_or(18);
+            total_chain_obj.insert(
+                token_addr.clone(),
+                json!(u256_to_decimal_string(sum, dec, false)),
+            );
+        }
+
+        EVM_NET_OK.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            network = %net,
+            elapsed_ms = net_start.elapsed().as_millis(),
+            evm_ok = EVM_NET_OK.load(Ordering::Relaxed),
+            evm_fail = EVM_NET_FAIL.load(Ordering::Relaxed),
+            "evm network processed"
+        );
+
+        if state.cfg.worker_slow_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(state.cfg.worker_slow_ms)).await;
+        }
+    }
+
+    snapshots.update_one(
+        doc! { "requestKey": request_key },
+        doc! {
+            "$set": {
+                "lastUpdatedAt": DateTime::now(),
+                "refreshState": "running",
+                "isComplete": false
+            }
+        },
+    ).await?;
+
+    // ==========================
+    // SOL processing
+    // ==========================
+    if !req.solana_wallet_addresses.is_empty() {
+        let sol_start = Instant::now();
+        let sol_rpc = SolanaRpcClient::new(state.cfg.solana_rpc_url.clone(), state.cfg.rpc_timeout_ms);
+        let sol_mints = sol_mints_from_request(&req);
+
+        let mut sol_total_lamports: u128 = 0;
+        let mut spl_totals: std::collections::HashMap<String, u128> = std::collections::HashMap::new();
+        let mut spl_decimals: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+
+        for w in &req.solana_wallet_addresses {
+            let row_idx = *sol_wallet_index
+                .get(w)
+                .ok_or_else(|| anyhow!("sol wallet index missing"))?;
+
+            let lamports = sol_rpc.get_balance_lamports(w).await.unwrap_or_else(|e| {
+                SOL_NET_FAIL.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(wallet = %w, error = %e, "sol getBalance failed -> keeping zero");
+                0u64
+            });
+
+            sol_total_lamports = sol_total_lamports.saturating_add(lamports as u128);
+
+            {
+                let data_arr = final_result
+                    .get_mut("data")
+                    .and_then(|v| v.as_array_mut())
+                    .ok_or_else(|| anyhow!("final_result.data missing or not array"))?;
+
+                let row = data_arr
+                    .get_mut(row_idx)
+                    .ok_or_else(|| anyhow!("wallet row missing"))?;
+
+                let bal_obj = row
+                    .get_mut("balance")
+                    .and_then(|v| v.as_object_mut())
+                    .ok_or_else(|| anyhow!("balance field not an object"))?;
+
+                if !bal_obj.contains_key("sol") {
+                    bal_obj.insert("sol".to_string(), json!({}));
+                }
+                let sol_obj = bal_obj
+                    .get_mut("sol")
+                    .and_then(|v| v.as_object_mut())
+                    .ok_or_else(|| anyhow!("balance.sol missing or not object"))?;
+
+                sol_obj.insert(
+                    "sol".to_string(),
+                    json!(lamports_u128_to_sol_fixed_18(lamports as u128)),
+                );
+            }
+
+            for mint in &sol_mints {
+                if !is_valid_solana_pubkey_32(mint) {
+                    continue;
+                }
+
+                let (amt_u128, dec_u32) = sol_rpc
+                    .get_spl_balance_by_owner_mint(w, mint)
+                    .await
+                    .unwrap_or_else(|e| {
+                        SOL_NET_FAIL.fetch_add(1, Ordering::Relaxed);
+                        tracing::error!(wallet = %w, mint = %mint, error = %e, "sol spl fetch failed");
+                        (0u128, 0u32)
+                    });
+
+                if dec_u32 > 0 {
+                    spl_decimals.entry(mint.clone()).or_insert(dec_u32);
+                }
+
+                *spl_totals.entry(mint.clone()).or_insert(0u128) += amt_u128;
+
+                let final_decimals = if dec_u32 > 0 {
+                    dec_u32
+                } else {
+                    *spl_decimals.get(mint).unwrap_or(&0)
+                };
+
+                let formatted = u128_base_units_to_fixed_18(amt_u128, final_decimals);
+
+                let data_arr = final_result
+                    .get_mut("data")
+                    .and_then(|v| v.as_array_mut())
+                    .ok_or_else(|| anyhow!("final_result.data missing or not array"))?;
+
+                let row = data_arr
+                    .get_mut(row_idx)
+                    .ok_or_else(|| anyhow!("wallet row missing"))?;
+
+                let bal_obj = row
+                    .get_mut("balance")
+                    .and_then(|v| v.as_object_mut())
+                    .ok_or_else(|| anyhow!("balance field not an object"))?;
+
+                if !bal_obj.contains_key("sol") {
+                    bal_obj.insert("sol".to_string(), json!({}));
+                }
+                let sol_obj = bal_obj
+                    .get_mut("sol")
+                    .and_then(|v| v.as_object_mut())
+                    .ok_or_else(|| anyhow!("balance.sol missing or not object"))?;
+
+                sol_obj.insert(mint.clone(), json!(formatted));
+            }
+        }
+
+        {
+            let totals_balance_obj = final_result
+                .get_mut("total")
+                .and_then(|v| v.as_object_mut())
+                .and_then(|m| m.get_mut("balance"))
+                .and_then(|v| v.as_object_mut())
+                .ok_or_else(|| anyhow!("final_result.total.balance missing or not object"))?;
+
+            if !totals_balance_obj.contains_key("sol") {
+                totals_balance_obj.insert("sol".to_string(), json!({}));
+            }
+            if let Some(sol_total_obj) = totals_balance_obj
+                .get_mut("sol")
+                .and_then(|v| v.as_object_mut())
+            {
+                sol_total_obj.insert(
+                    "sol".to_string(),
+                    json!(lamports_u128_to_sol_fixed_18(sol_total_lamports)),
+                );
+
+                for mint in &sol_mints {
+                    let sum = spl_totals.get(mint).cloned().unwrap_or(0u128);
+                    let dec = spl_decimals.get(mint).cloned().unwrap_or(0u32);
+                    sol_total_obj
+                        .insert(mint.clone(), json!(u128_base_units_to_fixed_18(sum, dec)));
+                }
+            }
+        }
+
+        SOL_NET_OK.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            elapsed_ms = sol_start.elapsed().as_millis(),
+            sol_ok = SOL_NET_OK.load(Ordering::Relaxed),
+            sol_fail = SOL_NET_FAIL.load(Ordering::Relaxed),
+            mints = sol_mints.len(),
+            wallets = req.solana_wallet_addresses.len(),
+            "sol network processed"
+        );
+    }
+
+    let has_changed = final_result != initial_result_json;
+
+    snapshots.update_one(
+        doc! { "requestKey": request_key },
+        doc! {
+            "$set": {
+                "lastUpdatedAt": now,
+                "refreshState": "idle",
+                "isComplete": true,
+                "hasChanged": has_changed,
+                "result": bson::to_bson(&final_result).unwrap_or(bson::Bson::Null),
+                "normalizedRequest": bson::to_bson(&req_sanitized_json).unwrap_or(bson::Bson::Null)
+            }
+        }
+    ).await?;
+
+    let jobs = state.mongo.db.collection::<bson::Document>("balance_refresh_jobs");
+    jobs.update_one(
+        doc! { "requestKey": request_key },
+        doc! { "$set": { "status": "done", "updatedAt": now } },
+    ).await?;
+
+    Ok(())
+}
+
+async fn mark_job_failed(state: &AppState, request_key: &str) -> Result<(), mongodb::error::Error> {
+    let jobs = state.mongo.db.collection::<bson::Document>("balance_refresh_jobs");
+    let now = DateTime::now();
+    let job = jobs.find_one(doc! { "requestKey": request_key }).await?;
+    
+    let attempts = job
+        .as_ref()
+        .and_then(|d| d.get_i32("attempts").ok())
+        .unwrap_or(0) + 1;
+
+    let backoff_secs = (attempts as i64) * 5;
+    let next_retry_ms = now.timestamp_millis() + backoff_secs * 1000;
+    let next_retry = DateTime::from_millis(next_retry_ms);
+
+    jobs.update_one(
+        doc! { "requestKey": request_key },
+        doc! {
+            "$set": {
+                "status": "queued",
+                "updatedAt": now,
+                "nextRetryAt": next_retry
+            },
+            "$setOnInsert": { "createdAt": now },
+            "$inc": { "attempts": 1 }
+        },
+    ).await?;
+
+    Ok(())
+}
+
+
