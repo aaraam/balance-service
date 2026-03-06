@@ -25,6 +25,32 @@ fn is_valid_solana_pubkey_32(s: &str) -> bool {
     decoded.len() == 32
 }
 
+pub fn is_valid_tron_address(s: &str) -> bool {
+    use sha2::{Digest, Sha256};
+
+    let t = s.trim();
+    if t.is_empty() || !t.starts_with('T') {
+        return false;
+    }
+
+    let decoded = match bs58::decode(t).into_vec() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if decoded.len() != 25 {
+        return false;
+    }
+
+    let (payload, checksum) = decoded.split_at(21);
+    if payload[0] != 0x41 {
+        return false;
+    }
+
+    let h1 = Sha256::digest(payload);
+    let h2 = Sha256::digest(&h1);
+    checksum == &h2[..4]
+}
+
 pub fn supported_evm_networks() -> std::collections::HashMap<&'static str, &'static str> {
     let mut m = std::collections::HashMap::new();
     m.insert("eth", "Ethereum");
@@ -56,54 +82,87 @@ pub fn supported_evm_networks() -> std::collections::HashMap<&'static str, &'sta
 pub fn normalize_request(req: &BalanceRequest) -> BalanceRequest {
     let evm_supported = supported_evm_networks();
 
+    // 1. walletAddresses is STRICTLY EVM-only now
     let mut wallet_addresses: Vec<String> = req
         .wallet_addresses
         .iter()
-        .map(|w| w.to_lowercase())
+        .map(|w| w.trim().to_lowercase())
         .filter(|w| is_valid_evm_h160(w))
         .collect();
+    
     wallet_addresses.sort();
     wallet_addresses.dedup();
 
+    // 2. Solana stays separate
     let mut sol_wallets: Vec<String> = req
         .solana_wallet_addresses
         .iter()
         .map(|w| w.trim().to_string())
         .filter(|w| is_valid_solana_pubkey_32(w))
         .collect();
+        
     sol_wallets.sort();
     sol_wallets.dedup();
 
-    // TRON IS DISABLED. We clear any TRON input immediately.
-    let tron_wallets: Vec<String> = Vec::new();
+    // 3. We no longer care about explicitly passed TRON wallets for this flow
+    // But we keep the field empty to satisfy the struct
+    let tron_wallets: Vec<String> = vec![];
 
+    // 4. Contracts (Your existing logic here is already correct and preserves "trx")
     let mut contracts: Vec<ContractGroup> = req
         .contracts
         .iter()
         .filter_map(|c| {
             let net = c.network_name.to_lowercase();
 
-            if is_ignored_network(net.as_str()) || net == "trx" {
+            if is_ignored_network(net.as_str()) {
                 return None;
             }
 
-            if net != "sol" && !evm_supported.contains_key(net.as_str()) {
-                return None;
-            }
-
-            let mut addrs: Vec<String> = if net == "sol" {
-                c.contract_addresses
+            if net == "sol" {
+                let mut addrs: Vec<String> = c
+                    .contract_addresses
                     .iter()
                     .map(|a| a.trim().to_string())
                     .filter(|a| is_valid_solana_pubkey_32(a))
-                    .collect()
-            } else {
-                c.contract_addresses
+                    .collect();
+                addrs.sort();
+                addrs.dedup();
+                return if addrs.is_empty() { None } else {
+                    Some(ContractGroup {
+                        network_name: net,
+                        contract_addresses: addrs,
+                    })
+                };
+            }
+
+            if net == "trx" {
+                let mut addrs: Vec<String> = c
+                    .contract_addresses
                     .iter()
-                    .map(|a| a.to_lowercase())
-                    .filter(|a| is_valid_evm_h160(a))
-                    .collect()
-            };
+                    .map(|a| a.trim().to_string())
+                    .filter(|a| is_valid_tron_address(a))
+                    .collect();
+                addrs.sort();
+                addrs.dedup();
+                return if addrs.is_empty() { None } else {
+                    Some(ContractGroup {
+                        network_name: net,
+                        contract_addresses: addrs,
+                    })
+                };
+            }
+
+            if !evm_supported.contains_key(net.as_str()) {
+                return None;
+            }
+
+            let mut addrs: Vec<String> = c
+                .contract_addresses
+                .iter()
+                .map(|a| a.trim().to_lowercase())
+                .filter(|a| is_valid_evm_h160(a))
+                .collect();
             addrs.sort();
             addrs.dedup();
 
@@ -112,7 +171,6 @@ pub fn normalize_request(req: &BalanceRequest) -> BalanceRequest {
                 contract_addresses: addrs,
             })
         })
-        .filter(|cg| !cg.contract_addresses.is_empty())
         .collect();
 
     contracts.sort_by(|a, b| a.network_name.cmp(&b.network_name));

@@ -7,22 +7,42 @@ use serde_json::json;
 use tokio::time::Duration;
 
 use crate::chains::{is_ignored_network, supported_evm_networks};
+use crate::core::chains_meta::native_symbol_for;
 use crate::core::normalize::normalize_request;
 use crate::evm::format::u256_to_decimal_string;
 use crate::evm::multicall3::{
     fetch_balances_multicall3, fetch_token_decimals_multicall3, EvmBalances,
 };
 use crate::evm::rpc::RpcClient;
-use crate::http::dto::{zero_result_from_request, BalanceRequest};
+use crate::http::dto::{trc20_contracts_from_request, zero_result_from_request, BalanceRequest};
 use crate::solana::rpc::SolanaRpcClient;
+use crate::tron::multicall3::{
+    fetch_all_tron_balances, fetch_native_trx_concurrent, fetch_trc20_decimals,
+    MAX_TRON_CALLS_PER_BATCH, TRON_NATIVE_CONCURRENCY,
+};
+use crate::tron::rpc::TronRpcClient;
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 const MAX_CALLS_PER_BATCH: usize = 600;
-
 const NATIVE_DECIMALS: u32 = 18;
 const SOL_DECIMALS: u32 = 9;
+
+// TRON phase guards — prevent large requests from turning into latency grenades.
+const TRON_MAX_WALLETS_PER_JOB: usize = 100;
+const TRON_MAX_TOKENS_PER_JOB: usize = 20;
+const TRON_MAX_PAIR_CALLS_PER_JOB: usize = 1000;
+/// Hard wall-clock budget for the entire TRON phase. If TRON exceeds this,
+/// EVM/SOL results are already persisted and the job completes without TRON.
+// Must be larger than (TRON_CALL_TIMEOUT_MS/1000 * worst-case sequential depth).
+// Native calls run concurrently, but TRC20 pair chunks run sequentially.
+// Budget = (chunks * per_call_timeout) + headroom. 20s is safe for typical request sizes.
+const TRON_TOTAL_PHASE_TIMEOUT_SECS: u64 = 10;
+// Per-call HTTP timeout for TRON calls — deliberately shorter than EVM rpc_timeout_ms.
+// Keeps a single slow call from eating the entire phase budget.
+const TRON_CALL_TIMEOUT_MS: u64 = 5_000;
 
 // --- metrics ---
 static JOBS_CLAIMED: AtomicU64 = AtomicU64::new(0);
@@ -35,6 +55,9 @@ static EVM_NET_FAIL: AtomicU64 = AtomicU64::new(0);
 static SOL_NET_OK: AtomicU64 = AtomicU64::new(0);
 static SOL_NET_FAIL: AtomicU64 = AtomicU64::new(0);
 
+static TRON_NET_OK: AtomicU64 = AtomicU64::new(0);
+static TRON_NET_FAIL: AtomicU64 = AtomicU64::new(0);
+
 fn is_valid_solana_pubkey_32(s: &str) -> bool {
     let t = s.trim();
     if t.is_empty() {
@@ -42,21 +65,9 @@ fn is_valid_solana_pubkey_32(s: &str) -> bool {
     }
     let decoded = match bs58::decode(t).into_vec() {
         Ok(v) => v,
-        Err(_) => {
-            return false;
-        }
+        Err(_) => return false,
     };
     decoded.len() == 32
-}
-
-fn native_symbol_for(network: &str) -> &str {
-    match network {
-        "eth" => "eth",
-        "bnb" => "bnb",
-        "matic" => "matic",
-        "op" => "op",
-        _ => network,
-    }
 }
 
 fn u128_base_units_to_fixed_18(value: u128, decimals: u32) -> String {
@@ -73,6 +84,7 @@ fn u128_base_units_to_fixed_18(value: u128, decimals: u32) -> String {
 
     let whole = if pow == 0 { 0 } else { value / pow };
     let frac = if pow == 0 { 0 } else { value % pow };
+
     let mut frac_str = frac.to_string();
     let dec_usize = decimals as usize;
 
@@ -93,12 +105,44 @@ fn lamports_u128_to_sol_fixed_18(lamports: u128) -> String {
     u128_base_units_to_fixed_18(lamports, SOL_DECIMALS)
 }
 
+fn sun_to_trx_fixed_18(sun: u64) -> String {
+    u128_base_units_to_fixed_18(sun as u128, 6)
+}
+
 fn sol_mints_from_request(req: &BalanceRequest) -> Vec<String> {
     req.contracts
         .iter()
         .find(|c| c.network_name == "sol")
         .map(|c| c.contract_addresses.clone())
         .unwrap_or_default()
+}
+
+/// Persist the current in-memory `final_result` into the snapshot document.
+/// Called after each chain-family phase so the API can return partial data
+/// without waiting for the full job to complete.
+async fn persist_partial_result(
+    snapshots: &mongodb::Collection<bson::Document>,
+    request_key: &str,
+    final_result: &serde_json::Value,
+    req_sanitized_json: &serde_json::Value,
+    stage: &str,
+) -> Result<(), anyhow::Error> {
+    snapshots
+        .update_one(
+            doc! { "requestKey": request_key },
+            doc! {
+                "$set": {
+                    "lastUpdatedAt": DateTime::now(),
+                    "refreshState": "running",
+                    "isComplete": false,
+                    "progressStage": stage,
+                    "result": bson::to_bson(final_result).unwrap_or(bson::Bson::Null),
+                    "normalizedRequest": bson::to_bson(req_sanitized_json).unwrap_or(bson::Bson::Null),
+                }
+            },
+        )
+        .await?;
+    Ok(())
 }
 
 pub async fn run_worker(state: AppState) {
@@ -138,7 +182,7 @@ pub async fn run_worker(state: AppState) {
         }
 
         let poll_ms = state.cfg.worker_poll_ms.max(50);
-        
+
         let mut batch_stream = match consumer.fetch().max_messages(32).messages().await {
             Ok(s) => s,
             Err(e) => {
@@ -149,6 +193,7 @@ pub async fn run_worker(state: AppState) {
         };
 
         let mut fetched = Vec::new();
+
         while let Some(msg_result) = batch_stream.next().await {
             if let Ok(msg) = msg_result {
                 fetched.push(msg);
@@ -161,6 +206,7 @@ pub async fn run_worker(state: AppState) {
         }
 
         let state_ref = &state;
+
         stream::iter(fetched)
             .for_each_concurrent(worker_pool, |msg| async move {
                 let request_key = match std::str::from_utf8(msg.payload.as_ref()) {
@@ -185,6 +231,7 @@ pub async fn run_worker(state: AppState) {
                     };
                     let update = doc! { "$set": { "status": "running", "updatedAt": now } };
                     let opts = FindOneAndUpdateOptions::builder().return_document(ReturnDocument::After).build();
+
                     let doc_opt = coll.find_one_and_update(filter, update).with_options(opts).await?;
                     Ok(doc_opt.is_some())
                 }
@@ -235,6 +282,7 @@ pub async fn run_worker(state: AppState) {
 
 async fn run_worker_mongo_fallback(state: AppState) {
     let poll_ms = state.cfg.worker_poll_ms;
+
     tracing::info!(
         worker_enabled = state.cfg.worker_enabled,
         poll_ms = poll_ms,
@@ -350,6 +398,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         });
 
     let req: BalanceRequest = normalize_request(&req_raw);
+
     let req_sanitized_json = serde_json::to_value(&req).unwrap_or_else(|_| json!({}));
     let mut final_result = zero_result_from_request(&req);
 
@@ -487,6 +536,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         }
 
         let mut native_sum = ethereum_types::U256::zero();
+
         for w in &req.wallet_addresses {
             native_sum += balances.native.get(w).cloned().unwrap_or_default();
         }
@@ -514,6 +564,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
 
         for token_addr in &cg.contract_addresses {
             let mut sum = ethereum_types::U256::zero();
+
             for w in &req.wallet_addresses {
                 let v = balances
                     .erc20
@@ -525,6 +576,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             }
 
             let dec = decimals_map.get(token_addr).cloned().unwrap_or(18);
+
             total_chain_obj.insert(
                 token_addr.clone(),
                 json!(u256_to_decimal_string(sum, dec, false)),
@@ -532,6 +584,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         }
 
         EVM_NET_OK.fetch_add(1, Ordering::Relaxed);
+
         tracing::debug!(
             network = %net,
             elapsed_ms = net_start.elapsed().as_millis(),
@@ -545,16 +598,11 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         }
     }
 
-    snapshots.update_one(
-        doc! { "requestKey": request_key },
-        doc! {
-            "$set": {
-                "lastUpdatedAt": DateTime::now(),
-                "refreshState": "running",
-                "isComplete": false
-            }
-        },
-    ).await?;
+    // Persist EVM results immediately — SOL and TRON do not block clients from
+    // seeing EVM balances anymore.
+    persist_partial_result(&snapshots, request_key, &final_result, &req_sanitized_json, "evm_done")
+        .await
+        .unwrap_or_else(|e| tracing::warn!(error = %e, "partial persist after EVM failed (non-fatal)"));
 
     // ==========================
     // SOL processing
@@ -586,16 +634,13 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                     .get_mut("data")
                     .and_then(|v| v.as_array_mut())
                     .ok_or_else(|| anyhow!("final_result.data missing or not array"))?;
-
                 let row = data_arr
                     .get_mut(row_idx)
                     .ok_or_else(|| anyhow!("wallet row missing"))?;
-
                 let bal_obj = row
                     .get_mut("balance")
                     .and_then(|v| v.as_object_mut())
                     .ok_or_else(|| anyhow!("balance field not an object"))?;
-
                 if !bal_obj.contains_key("sol") {
                     bal_obj.insert("sol".to_string(), json!({}));
                 }
@@ -603,7 +648,6 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                     .get_mut("sol")
                     .and_then(|v| v.as_object_mut())
                     .ok_or_else(|| anyhow!("balance.sol missing or not object"))?;
-
                 sol_obj.insert(
                     "sol".to_string(),
                     json!(lamports_u128_to_sol_fixed_18(lamports as u128)),
@@ -642,16 +686,13 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                     .get_mut("data")
                     .and_then(|v| v.as_array_mut())
                     .ok_or_else(|| anyhow!("final_result.data missing or not array"))?;
-
                 let row = data_arr
                     .get_mut(row_idx)
                     .ok_or_else(|| anyhow!("wallet row missing"))?;
-
                 let bal_obj = row
                     .get_mut("balance")
                     .and_then(|v| v.as_object_mut())
                     .ok_or_else(|| anyhow!("balance field not an object"))?;
-
                 if !bal_obj.contains_key("sol") {
                     bal_obj.insert("sol".to_string(), json!({}));
                 }
@@ -704,6 +745,183 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         );
     }
 
+    // Persist EVM + SOL so the client sees these immediately, before TRON runs.
+    persist_partial_result(&snapshots, request_key, &final_result, &req_sanitized_json, "sol_done")
+        .await
+        .unwrap_or_else(|e| tracing::warn!(error = %e, "partial persist after SOL failed (non-fatal)"));
+
+    // ==========================
+    // TRON processing (Derived from EVM)
+    // ==========================
+    let trc20_contracts = trc20_contracts_from_request(&req);
+    let has_trx = !trc20_contracts.is_empty() || req.contracts.iter().any(|c| c.network_name == "trx");
+
+    if has_trx && !req.wallet_addresses.is_empty() {
+        let tron_rpc = TronRpcClient::new(
+            state.cfg.tron_fullnode_url.clone(),
+            state.cfg.tron_solidity_url.clone(),
+            state.cfg.tron_api_key.clone(),
+            TRON_CALL_TIMEOUT_MS, // intentionally shorter than EVM rpc_timeout_ms
+        );
+
+        // Build (row_idx, b58_wallet) pairs from EVM wallets
+        let mut all_tron_targets: Vec<(usize, String)> = Vec::new();
+        for (evm_w, &row_idx) in &evm_wallet_index {
+            match crate::tron::address::evm_hex_to_tron_b58(evm_w) {
+                Ok(b58) => all_tron_targets.push((row_idx, b58)),
+                Err(_) => tracing::warn!(wallet = %evm_w, "failed to derive TRON b58 from EVM"),
+            }
+        }
+
+        // Apply wallet budget — cap before fan-out
+        let tron_targets: Vec<(usize, String)> = all_tron_targets
+            .into_iter()
+            .take(TRON_MAX_WALLETS_PER_JOB)
+            .collect();
+        let b58_wallets: Vec<String> = tron_targets.iter().map(|(_, b)| b.clone()).collect();
+
+        // Apply TRC20 budget — decide whether to do full fetch or native-only
+        let effective_contracts: Vec<String> = trc20_contracts
+            .iter()
+            .take(TRON_MAX_TOKENS_PER_JOB)
+            .cloned()
+            .collect();
+        let pair_count = b58_wallets.len() * effective_contracts.len();
+        let do_trc20 = !effective_contracts.is_empty() && pair_count <= TRON_MAX_PAIR_CALLS_PER_JOB;
+
+        if !effective_contracts.is_empty() && !do_trc20 {
+            tracing::warn!(
+                wallets = b58_wallets.len(),
+                contracts = trc20_contracts.len(),
+                pair_count = pair_count,
+                limit = TRON_MAX_PAIR_CALLS_PER_JOB,
+                "TRON TRC20 skipped: request too large, fetching native TRX only"
+            );
+        }
+
+        // Wrap the entire TRON phase in a hard timeout so a slow provider
+        // never holds EVM/SOL results hostage.
+        let tron_start = Instant::now();
+        let tron_phase = async {
+            let native_balances = fetch_native_trx_concurrent(
+                &tron_rpc,
+                &b58_wallets,
+                TRON_NATIVE_CONCURRENCY,
+            )
+            .await;
+
+            let trc20_balances: HashMap<String, HashMap<String, u128>> =
+                if do_trc20 {
+                    fetch_all_tron_balances(
+                        &tron_rpc,
+                        &b58_wallets,
+                        &effective_contracts,
+                        MAX_TRON_CALLS_PER_BATCH,
+                    )
+                    .await
+                } else {
+                    HashMap::new()
+                };
+
+            let decimals_map: HashMap<String, u32> =
+                if do_trc20 && !b58_wallets.is_empty() {
+                    fetch_trc20_decimals(
+                        &tron_rpc,
+                        &effective_contracts,
+                        &b58_wallets[0],
+                        MAX_TRON_CALLS_PER_BATCH,
+                    )
+                    .await
+                } else {
+                    HashMap::new()
+                };
+
+            (native_balances, trc20_balances, decimals_map)
+        };
+
+        match tokio::time::timeout(
+            Duration::from_secs(TRON_TOTAL_PHASE_TIMEOUT_SECS),
+            tron_phase,
+        )
+        .await
+        {
+            Ok((native_balances, trc20_balances, decimals_map)) => {
+                let mut trx_total_sun: u64 = 0;
+                let mut trc20_totals: HashMap<String, u128> = HashMap::new();
+
+                for (row_idx, b58_w) in &tron_targets {
+                    let sun = *native_balances.get(b58_w).unwrap_or(&0);
+                    trx_total_sun = trx_total_sun.saturating_add(sun);
+
+                    let data_arr = final_result
+                        .get_mut("data")
+                        .and_then(|v| v.as_array_mut())
+                        .unwrap();
+                    let row = data_arr.get_mut(*row_idx).unwrap();
+                    let bal_obj = row.get_mut("balance").and_then(|v| v.as_object_mut()).unwrap();
+
+                    let trx_obj = bal_obj
+                        .entry("trx".to_string())
+                        .or_insert_with(|| json!({}))
+                        .as_object_mut()
+                        .unwrap();
+
+                    trx_obj.insert("trx".to_string(), json!(sun_to_trx_fixed_18(sun)));
+
+                    if let Some(tokens) = trc20_balances.get(b58_w) {
+                        for (contract, amount) in tokens {
+                            let dec = *decimals_map.get(contract).unwrap_or(&6);
+                            let formatted = u128_base_units_to_fixed_18(*amount, dec);
+                            trx_obj.insert(contract.clone(), json!(formatted));
+                            *trc20_totals.entry(contract.clone()).or_insert(0) += *amount;
+                        }
+                    }
+                }
+
+                // TRON totals
+                let totals_balance_obj = final_result
+                    .get_mut("total")
+                    .and_then(|v| v.as_object_mut())
+                    .and_then(|m| m.get_mut("balance"))
+                    .and_then(|v| v.as_object_mut())
+                    .unwrap();
+
+                let trx_total_obj = totals_balance_obj
+                    .entry("trx".to_string())
+                    .or_insert_with(|| json!({}))
+                    .as_object_mut()
+                    .unwrap();
+
+                trx_total_obj.insert("trx".to_string(), json!(sun_to_trx_fixed_18(trx_total_sun)));
+
+                for (contract, amount) in &trc20_totals {
+                    let dec = *decimals_map.get(contract).unwrap_or(&6);
+                    trx_total_obj.insert(
+                        contract.clone(),
+                        json!(u128_base_units_to_fixed_18(*amount, dec)),
+                    );
+                }
+
+                TRON_NET_OK.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    elapsed_ms = tron_start.elapsed().as_millis(),
+                    derived_wallets = b58_wallets.len(),
+                    trc20_contracts = effective_contracts.len(),
+                    "tron network processed"
+                );
+            }
+            Err(_) => {
+                // TRON timed out — EVM/SOL are already persisted. Log and continue.
+                TRON_NET_FAIL.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    elapsed_ms = tron_start.elapsed().as_millis(),
+                    budget_secs = TRON_TOTAL_PHASE_TIMEOUT_SECS,
+                    "TRON phase timed out -> job will complete with EVM/SOL only"
+                );
+            }
+        }
+    }
+
     let has_changed = final_result != initial_result_json;
 
     snapshots.update_one(
@@ -714,6 +932,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                 "refreshState": "idle",
                 "isComplete": true,
                 "hasChanged": has_changed,
+                "progressStage": "complete",
                 "result": bson::to_bson(&final_result).unwrap_or(bson::Bson::Null),
                 "normalizedRequest": bson::to_bson(&req_sanitized_json).unwrap_or(bson::Bson::Null)
             }
@@ -733,7 +952,7 @@ async fn mark_job_failed(state: &AppState, request_key: &str) -> Result<(), mong
     let jobs = state.mongo.db.collection::<bson::Document>("balance_refresh_jobs");
     let now = DateTime::now();
     let job = jobs.find_one(doc! { "requestKey": request_key }).await?;
-    
+
     let attempts = job
         .as_ref()
         .and_then(|d| d.get_i32("attempts").ok())

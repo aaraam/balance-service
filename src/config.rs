@@ -109,7 +109,11 @@ impl AppConfig {
 
         let tron_fullnode_url = std::env::var("TRON_FULLNODE_URL").unwrap_or_default();
         let tron_solidity_url = std::env::var("TRON_SOLIDITY_URL").unwrap_or_default();
-        let tron_api_key = std::env::var("TRON_TEMP_KEY").ok();
+
+        // Accept sane env name first, but keep backward compatibility
+        let tron_api_key = std::env::var("TRON_API_KEY")
+            .ok()
+            .or_else(|| std::env::var("TRON_TEMP_KEY").ok());
 
         Ok(Self {
             bind_addr,

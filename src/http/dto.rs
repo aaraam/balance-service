@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use crate::core::chains_meta::native_symbol_for;
 use crate::http::error::ApiErrorBody;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,22 +54,10 @@ pub struct BalanceResponse {
 
 const ZERO_18: &str = "0.000000000000000000";
 
-fn native_symbol_for(network: &str) -> &str {
-    match network {
-        "eth" => "eth",
-        "bnb" => "bnb",
-        "matic" => "matic",
-        "op" => "op",
-        "sol" => "sol",
-        "trx" => "trx",
-        _ => network,
-    }
-}
-
-fn sol_mints_from_request(req: &BalanceRequest) -> Vec<String> {
+pub fn trc20_contracts_from_request(req: &BalanceRequest) -> Vec<String> {
     req.contracts
         .iter()
-        .find(|c| c.network_name == "sol")
+        .find(|c| c.network_name == "trx")
         .map(|c| c.contract_addresses.clone())
         .unwrap_or_default()
 }
@@ -77,84 +66,88 @@ pub fn zero_result_from_request(req: &BalanceRequest) -> serde_json::Value {
     use serde_json::json;
     use serde_json::Map;
 
-    let sol_mints = sol_mints_from_request(req);
+    let sol_mints = req.contracts
+        .iter()
+        .find(|c| c.network_name == "sol")
+        .map(|c| c.contract_addresses.clone())
+        .unwrap_or_default();
+    
+    let trc20_contracts = trc20_contracts_from_request(req);
+    let has_trx = !trc20_contracts.is_empty() || req.contracts.iter().any(|c| c.network_name == "trx");
+
     let mut data: Vec<serde_json::Value> = Vec::new();
 
-    // ---- EVM rows ----
+    // EVM + TRON Bundled
     for w in &req.wallet_addresses {
         let mut balance_obj: Map<String, serde_json::Value> = Map::new();
 
+        // 1. Build EVM Networks
         for cg in &req.contracts {
             let net = cg.network_name.as_str();
+            if net == "sol" || net == "trx" { continue; }
 
-            if net == "sol" || net == "trx" {
-                continue;
+            let mut net_obj: Map<String, serde_json::Value> = Map::new();
+            net_obj.insert(native_symbol_for(net).to_string(), json!(ZERO_18));
+            for addr in &cg.contract_addresses {
+                net_obj.insert(addr.clone(), json!(ZERO_18));
             }
-
-            let mut chain_obj: Map<String, serde_json::Value> = Map::new();
-            chain_obj.insert(native_symbol_for(net).to_string(), json!(ZERO_18));
-
-            for token_addr in &cg.contract_addresses {
-                chain_obj.insert(token_addr.clone(), json!(ZERO_18));
-            }
-
-            balance_obj.insert(net.to_string(), json!(chain_obj));
+            balance_obj.insert(net.to_string(), json!(net_obj));
         }
 
-        data.push(json!({
-            "walletAddress": w,
-            "balance": balance_obj
-        }));
+        // 2. Inject Derived TRON Identity
+        if has_trx {
+            let mut trx_obj: Map<String, serde_json::Value> = Map::new();
+            trx_obj.insert("trx".to_string(), json!(ZERO_18));
+            for addr in &trc20_contracts {
+                trx_obj.insert(addr.clone(), json!(ZERO_18));
+            }
+            balance_obj.insert("trx".to_string(), json!(trx_obj));
+        }
+
+        data.push(json!({ "walletAddress": w, "balance": balance_obj }));
     }
 
-    // ---- SOL rows ----
+    // SOL
     for w in &req.solana_wallet_addresses {
-        let mut balance_obj: Map<String, serde_json::Value> = Map::new();
         let mut sol_obj: Map<String, serde_json::Value> = Map::new();
-        
         sol_obj.insert("sol".to_string(), json!(ZERO_18));
-
         for mint in &sol_mints {
             sol_obj.insert(mint.clone(), json!(ZERO_18));
         }
-
-        balance_obj.insert("sol".to_string(), json!(sol_obj));
-
-        data.push(json!({
-            "walletAddress": w,
-            "balance": balance_obj
-        }));
+        data.push(json!({ "walletAddress": w, "balance": { "sol": sol_obj } }));
     }
 
-    // ---- Totals ----
+    // Totals
     let mut totals: Map<String, serde_json::Value> = Map::new();
 
     for cg in &req.contracts {
         let net = cg.network_name.as_str();
-
-        if net == "sol" || net == "trx" {
-            continue;
+        if net == "sol" || net == "trx" { continue; }
+        
+        let mut net_obj: Map<String, serde_json::Value> = Map::new();
+        net_obj.insert(native_symbol_for(net).to_string(), json!(ZERO_18));
+        for addr in &cg.contract_addresses {
+            net_obj.insert(addr.clone(), json!(ZERO_18));
         }
-
-        let mut total_chain_obj: Map<String, serde_json::Value> = Map::new();
-        total_chain_obj.insert(native_symbol_for(net).to_string(), json!(ZERO_18));
-
-        for token_addr in &cg.contract_addresses {
-            total_chain_obj.insert(token_addr.clone(), json!(ZERO_18));
-        }
-
-        totals.insert(net.to_string(), json!(total_chain_obj));
+        totals.insert(net.to_string(), json!(net_obj));
     }
 
     if !req.solana_wallet_addresses.is_empty() {
-        let mut sol_total_obj: Map<String, serde_json::Value> = Map::new();
-        sol_total_obj.insert("sol".to_string(), json!(ZERO_18));
-        
+        let mut sol_obj: Map<String, serde_json::Value> = Map::new();
+        sol_obj.insert("sol".to_string(), json!(ZERO_18));
         for mint in &sol_mints {
-            sol_total_obj.insert(mint.clone(), json!(ZERO_18));
+            sol_obj.insert(mint.clone(), json!(ZERO_18));
         }
-        
-        totals.insert("sol".to_string(), json!(sol_total_obj));
+        totals.insert("sol".to_string(), json!(sol_obj));
+    }
+
+    if has_trx {
+        let mut trx_obj: Map<String, serde_json::Value> = Map::new();
+        trx_obj.insert("trx".to_string(), json!(ZERO_18));
+        for addr in &trc20_contracts {
+            trx_obj.insert(addr.clone(), json!(ZERO_18));
+        }
+        totals.insert("trx".to_string(), json!(trx_obj));
     }
 
     json!({
