@@ -1,13 +1,10 @@
-// ==================================================
-// FILE: D:\Learn\rust\balance-service\src\db\snapshots.rs
-// ==================================================
-
 use crate::db::models::BalanceSnapshotDoc;
 use bson::doc;
 use mongodb::{options::FindOneOptions, Collection};
 use serde::{Deserialize, Serialize};
 
-// ✅ Mini-struct for type-safe status checking
+/// Mini-struct for lightweight status polling.
+/// Returned by `get_snapshot_status` — only fetches these fields from Mongo.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct SnapshotStatus {
     #[serde(rename = "isComplete", default)]
@@ -16,6 +13,9 @@ pub struct SnapshotStatus {
     pub has_changed: bool,
     #[serde(rename = "requestKey")]
     pub request_key: String,
+    /// Stage label written by the worker. May be absent on old snapshots.
+    #[serde(rename = "progressStage")]
+    pub progress_stage: Option<String>,
 }
 
 pub fn snapshots_collection(db: &mongodb::Database) -> Collection<BalanceSnapshotDoc> {
@@ -37,12 +37,11 @@ pub async fn ensure_indexes(db: &mongodb::Database) -> Result<(), mongodb::error
     Ok(())
 }
 
-/// ✅ Fetch ONLY status fields (Lightweight) using projection
+/// Fetch ONLY status fields (lightweight) using projection.
 pub async fn get_snapshot_status(
     db: &mongodb::Database,
     request_key: &str,
 ) -> Result<Option<SnapshotStatus>, mongodb::error::Error> {
-    // We use a raw document collection for the projection, then deserialize to our struct
     let coll = db.collection::<SnapshotStatus>("balance_snapshots");
 
     let filter = doc! { "requestKey": request_key };
@@ -52,11 +51,11 @@ pub async fn get_snapshot_status(
             "isComplete": 1,
             "hasChanged": 1,
             "requestKey": 1,
+            "progressStage": 1,
             "_id": 0
         })
         .build();
 
-    // ✅ FIXED: Chained .with_options() correctly
     coll.find_one(filter).with_options(options).await
 }
 
@@ -66,7 +65,6 @@ pub async fn get_snapshot(
 ) -> Result<Option<BalanceSnapshotDoc>, mongodb::error::Error> {
     let coll = snapshots_collection(db);
     let filter = doc! { "requestKey": request_key };
-    // ✅ FIXED: Removed unnecessary 'None' argument
     coll.find_one(filter).await
 }
 
@@ -91,7 +89,8 @@ pub async fn upsert_empty_snapshot(
             "lastUpdatedAt": now,
             "refreshState": "idle",
             "isComplete": false,
-            "hasChanged": false
+            "hasChanged": false,
+            "progressStage": "queued"
         }
     };
 

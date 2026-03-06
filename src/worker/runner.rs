@@ -34,12 +34,16 @@ const SOL_DECIMALS: u32 = 9;
 const TRON_MAX_WALLETS_PER_JOB: usize = 100;
 const TRON_MAX_TOKENS_PER_JOB: usize = 20;
 const TRON_MAX_PAIR_CALLS_PER_JOB: usize = 1000;
-/// Hard wall-clock budget for the entire TRON phase. If TRON exceeds this,
+
+/// Hard wall-clock budget for the entire TRON phase.
+/// If TRON exceeds this,
 /// EVM/SOL results are already persisted and the job completes without TRON.
 // Must be larger than (TRON_CALL_TIMEOUT_MS/1000 * worst-case sequential depth).
 // Native calls run concurrently, but TRC20 pair chunks run sequentially.
-// Budget = (chunks * per_call_timeout) + headroom. 20s is safe for typical request sizes.
-const TRON_TOTAL_PHASE_TIMEOUT_SECS: u64 = 10;
+// Budget = (chunks * per_call_timeout) + headroom.
+// 20s is safe for typical request sizes.
+const TRON_TOTAL_PHASE_TIMEOUT_SECS: u64 = 25;
+
 // Per-call HTTP timeout for TRON calls — deliberately shorter than EVM rpc_timeout_ms.
 // Keeps a single slow call from eating the entire phase budget.
 const TRON_CALL_TIMEOUT_MS: u64 = 5_000;
@@ -77,7 +81,6 @@ fn u128_base_units_to_fixed_18(value: u128, decimals: u32) -> String {
 
     let out_decimals: u32 = 18;
     let pow = (10u128).checked_pow(decimals.min(38)).unwrap_or(u128::MAX);
-
     if pow == u128::MAX && decimals > 38 {
         return format!("0.{}", "0".repeat(18));
     }
@@ -147,6 +150,7 @@ async fn persist_partial_result(
 
 pub async fn run_worker(state: AppState) {
     let worker_pool = state.cfg.worker_concurrency.max(1) as usize;
+
     tracing::info!(
         worker_enabled = state.cfg.worker_enabled,
         worker_pool = worker_pool,
@@ -193,7 +197,6 @@ pub async fn run_worker(state: AppState) {
         };
 
         let mut fetched = Vec::new();
-
         while let Some(msg_result) = batch_stream.next().await {
             if let Ok(msg) = msg_result {
                 fetched.push(msg);
@@ -229,6 +232,7 @@ pub async fn run_worker(state: AppState) {
                             { "nextRetryAt": { "$lte": now } }
                         ]
                     };
+
                     let update = doc! { "$set": { "status": "running", "updatedAt": now } };
                     let opts = FindOneAndUpdateOptions::builder().return_document(ReturnDocument::After).build();
 
@@ -262,6 +266,7 @@ pub async fn run_worker(state: AppState) {
                                     error = %e,
                                     "job failed"
                                 );
+
                                 let _ = mark_job_failed(state_ref, &request_key).await;
                                 let _ = msg.ack_with(async_nats::jetstream::AckKind::Nak(None)).await;
                             }
@@ -398,7 +403,6 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         });
 
     let req: BalanceRequest = normalize_request(&req_raw);
-
     let req_sanitized_json = serde_json::to_value(&req).unwrap_or_else(|_| json!({}));
     let mut final_result = zero_result_from_request(&req);
 
@@ -576,7 +580,6 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             }
 
             let dec = decimals_map.get(token_addr).cloned().unwrap_or(18);
-
             total_chain_obj.insert(
                 token_addr.clone(),
                 json!(u256_to_decimal_string(sum, dec, false)),
@@ -609,6 +612,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
     // ==========================
     if !req.solana_wallet_addresses.is_empty() {
         let sol_start = Instant::now();
+
         let sol_rpc = SolanaRpcClient::new(state.cfg.solana_rpc_url.clone(), state.cfg.rpc_timeout_ms);
         let sol_mints = sol_mints_from_request(&req);
 
@@ -634,13 +638,16 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                     .get_mut("data")
                     .and_then(|v| v.as_array_mut())
                     .ok_or_else(|| anyhow!("final_result.data missing or not array"))?;
+
                 let row = data_arr
                     .get_mut(row_idx)
                     .ok_or_else(|| anyhow!("wallet row missing"))?;
+
                 let bal_obj = row
                     .get_mut("balance")
                     .and_then(|v| v.as_object_mut())
                     .ok_or_else(|| anyhow!("balance field not an object"))?;
+
                 if !bal_obj.contains_key("sol") {
                     bal_obj.insert("sol".to_string(), json!({}));
                 }
@@ -648,6 +655,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                     .get_mut("sol")
                     .and_then(|v| v.as_object_mut())
                     .ok_or_else(|| anyhow!("balance.sol missing or not object"))?;
+
                 sol_obj.insert(
                     "sol".to_string(),
                     json!(lamports_u128_to_sol_fixed_18(lamports as u128)),
@@ -686,13 +694,16 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                     .get_mut("data")
                     .and_then(|v| v.as_array_mut())
                     .ok_or_else(|| anyhow!("final_result.data missing or not array"))?;
+
                 let row = data_arr
                     .get_mut(row_idx)
                     .ok_or_else(|| anyhow!("wallet row missing"))?;
+
                 let bal_obj = row
                     .get_mut("balance")
                     .and_then(|v| v.as_object_mut())
                     .ok_or_else(|| anyhow!("balance field not an object"))?;
+
                 if !bal_obj.contains_key("sol") {
                     bal_obj.insert("sol".to_string(), json!({}));
                 }
@@ -735,6 +746,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         }
 
         SOL_NET_OK.fetch_add(1, Ordering::Relaxed);
+
         tracing::debug!(
             elapsed_ms = sol_start.elapsed().as_millis(),
             sol_ok = SOL_NET_OK.load(Ordering::Relaxed),
@@ -766,6 +778,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
 
         // Build (row_idx, b58_wallet) pairs from EVM wallets
         let mut all_tron_targets: Vec<(usize, String)> = Vec::new();
+
         for (evm_w, &row_idx) in &evm_wallet_index {
             match crate::tron::address::evm_hex_to_tron_b58(evm_w) {
                 Ok(b58) => all_tron_targets.push((row_idx, b58)),
@@ -778,6 +791,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             .into_iter()
             .take(TRON_MAX_WALLETS_PER_JOB)
             .collect();
+
         let b58_wallets: Vec<String> = tron_targets.iter().map(|(_, b)| b.clone()).collect();
 
         // Apply TRC20 budget — decide whether to do full fetch or native-only
@@ -786,6 +800,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             .take(TRON_MAX_TOKENS_PER_JOB)
             .cloned()
             .collect();
+
         let pair_count = b58_wallets.len() * effective_contracts.len();
         let do_trc20 = !effective_contracts.is_empty() && pair_count <= TRON_MAX_PAIR_CALLS_PER_JOB;
 
@@ -857,6 +872,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                         .get_mut("data")
                         .and_then(|v| v.as_array_mut())
                         .unwrap();
+
                     let row = data_arr.get_mut(*row_idx).unwrap();
                     let bal_obj = row.get_mut("balance").and_then(|v| v.as_object_mut()).unwrap();
 
@@ -903,6 +919,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                 }
 
                 TRON_NET_OK.fetch_add(1, Ordering::Relaxed);
+
                 tracing::debug!(
                     elapsed_ms = tron_start.elapsed().as_millis(),
                     derived_wallets = b58_wallets.len(),

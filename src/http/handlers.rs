@@ -19,26 +19,24 @@ pub async fn get_job_status(
     State(state): State<AppState>,
     Path(request_key): Path<String>,
 ) -> impl IntoResponse {
-    let snap = snapshots::get_snapshot(&state.mongo.db, &request_key).await;
+    // Use lightweight projection to avoid fetching the massive result JSON
+    let snap = snapshots::get_snapshot_status(&state.mongo.db, &request_key).await;
 
     match snap {
-        Ok(Some(s)) => {
-            let is_complete = s.is_complete;
-            let has_changed = s.has_changed;
+        Ok(Some(s)) => (
+            StatusCode::OK,
+            Json(BalanceResponse {
+                status: true,
+                is_complete: s.is_complete,
+                has_changed: s.has_changed,
+                request_key,
+                result: serde_json::json!({}), // Return empty result to avoid heavy payloads
+                progress_stage: s.progress_stage,
+                error: None,
+            }),
+        )
+            .into_response(),
 
-            (
-                StatusCode::OK,
-                Json(BalanceResponse {
-                    status: true,
-                    is_complete,
-                    has_changed,
-                    request_key,
-                    result: s.result,
-                    error: None,
-                }),
-            )
-                .into_response()
-        }
         _ => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
@@ -90,8 +88,6 @@ pub async fn get_multi_wallet_balances(
                         let _ =
                             snapshots::set_refresh_state(&state.mongo.db, &request_key, "queued")
                                 .await;
-
-                        // push to durable queue
                         if let Err(e) = state.queue.publish(&request_key).await {
                             tracing::error!(request_key=%request_key, error=%e, "failed to publish job to queue");
                         }
@@ -105,8 +101,9 @@ pub async fn get_multi_wallet_balances(
                     status: true,
                     is_complete: existing_is_complete,
                     has_changed: existing.has_changed,
-                    result: existing.result,
+                    result: existing.result, // Main fetch still returns the full payload
                     request_key,
+                    progress_stage: existing.progress_stage,
                     error: None,
                 }),
             )
@@ -114,7 +111,9 @@ pub async fn get_multi_wallet_balances(
         }
 
         _ => {
-            let normalized_value = serde_json::to_value(&normalized).unwrap_or(serde_json::json!({}));
+            let normalized_value =
+                serde_json::to_value(&normalized).unwrap_or(serde_json::json!({}));
+
             let _ = snapshots::upsert_empty_snapshot(
                 &state.mongo.db,
                 &request_key,
@@ -128,9 +127,8 @@ pub async fn get_multi_wallet_balances(
             {
                 if did_queue {
                     let _ =
-                        snapshots::set_refresh_state(&state.mongo.db, &request_key, "queued").await;
-
-                    // push to durable queue
+                        snapshots::set_refresh_state(&state.mongo.db, &request_key, "queued")
+                            .await;
                     if let Err(e) = state.queue.publish(&request_key).await {
                         tracing::error!(request_key=%request_key, error=%e, "failed to publish job to queue");
                     }
@@ -145,6 +143,7 @@ pub async fn get_multi_wallet_balances(
                     has_changed: false,
                     result: zero_result,
                     request_key,
+                    progress_stage: Some("queued".to_string()),
                     error: None,
                 }),
             )

@@ -1,7 +1,3 @@
-// ==================================================
-// FILE: D:\Learn\rust\balance-service\src\http\error.rs
-// ==================================================
-
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -62,9 +58,9 @@ impl IntoResponse for ApiError {
             status: false,
             is_complete: false,
             has_changed: false,
-            // ✅ FIXED: Field added
             request_key: "".to_string(),
             result: serde_json::json!({}),
+            progress_stage: None,
             error: Some(self.body),
         };
 
