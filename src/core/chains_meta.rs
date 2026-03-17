@@ -14,19 +14,23 @@
 /// the frontend reads, so changes here affect the API contract.
 ///
 /// Rules applied:
-///   - ETH-native L1 + all OP-Stack / Arbitrum / other ETH-L2s  → "eth"
-///   - Mantle uses MNT (its own gas token), NOT ETH              → "mnt"
+///   - ETH-native L1 + ETH-L2s                                → "eth"
+///   - Optimism keeps legacy API compatibility                → "op"
+///   - Mantle uses MNT (its own gas token), NOT ETH          → "mnt"
 ///   - Every other L1 uses its own well-known symbol
 ///   - Fallback: return the network key itself (safe default)
 pub fn native_symbol_for(network: &str) -> &str {
     match network {
         // ── ETH-native chains ──────────────────────────────────────────
-        "eth" | "op" | "base" | "arb1" | "linea" | "aurora" | "mint" => "eth",
+        "eth" | "base" | "arb1" | "linea" | "aurora" | "mint" => "eth",
 
-        // ── Mantle: uses MNT as native gas token, NOT ETH ──────────────
+        // ── Optimism: keep legacy response key for compatibility ──────
+        "op" => "op",
+
+        // ── Mantle: uses MNT as native gas token, NOT ETH ─────────────
         "mantle" => "mnt",
 
-        // ── Independent L1s with their own native token ────────────────
+        // ── Independent L1s with their own native token ───────────────
         "bnb"      => "bnb",
         "matic"    => "matic",
         "avax"     => "avax",
@@ -43,11 +47,11 @@ pub fn native_symbol_for(network: &str) -> &str {
         "palm"     => "palm",
         "mcardano" => "milkada",
 
-        // ── Non-EVM (safe fallback)
+        // ── Non-EVM ────────────────────────────────────────────────────
         "sol" => "sol",
         "trx" => "trx",
 
-        // ── Fallback
+        // ── Fallback ───────────────────────────────────────────────────
         _ => network,
     }
 }
