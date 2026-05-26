@@ -104,6 +104,24 @@ fn u128_base_units_to_fixed_18(value: u128, decimals: u32) -> String {
     format!("{}.{}", whole, frac_str)
 }
 
+fn u256_base_units_to_fixed_18(value: ethereum_types::U256, decimals: u32) -> String {
+    if decimals == 0 {
+        return format!("{}.{}", value, "0".repeat(18));
+    }
+
+    let decimal = u256_to_decimal_string(value, decimals, false);
+    let (whole, fraction) = decimal.split_once('.').unwrap_or((&decimal, ""));
+    let mut fraction = fraction.to_string();
+
+    if fraction.len() < 18 {
+        fraction.push_str(&"0".repeat(18 - fraction.len()));
+    } else if fraction.len() > 18 {
+        fraction.truncate(18);
+    }
+
+    format!("{}.{}", whole, fraction)
+}
+
 fn lamports_u128_to_sol_fixed_18(lamports: u128) -> String {
     u128_base_units_to_fixed_18(lamports, SOL_DECIMALS)
 }
@@ -825,7 +843,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             )
             .await;
 
-            let trc20_balances: HashMap<String, HashMap<String, u128>> =
+            let trc20_balances: HashMap<String, HashMap<String, ethereum_types::U256>> =
                 if do_trc20 {
                     fetch_all_tron_balances(
                         &tron_rpc,
@@ -862,7 +880,7 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         {
             Ok((native_balances, trc20_balances, decimals_map)) => {
                 let mut trx_total_sun: u64 = 0;
-                let mut trc20_totals: HashMap<String, u128> = HashMap::new();
+                let mut trc20_totals: HashMap<String, ethereum_types::U256> = HashMap::new();
 
                 for (row_idx, b58_w) in &tron_targets {
                     let sun = *native_balances.get(b58_w).unwrap_or(&0);
@@ -886,10 +904,14 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
 
                     if let Some(tokens) = trc20_balances.get(b58_w) {
                         for (contract, amount) in tokens {
-                            let dec = *decimals_map.get(contract).unwrap_or(&6);
-                            let formatted = u128_base_units_to_fixed_18(*amount, dec);
+                            let Some(&dec) = decimals_map.get(contract) else {
+                                continue;
+                            };
+                            let formatted = u256_base_units_to_fixed_18(*amount, dec);
                             trx_obj.insert(contract.clone(), json!(formatted));
-                            *trc20_totals.entry(contract.clone()).or_insert(0) += *amount;
+                            *trc20_totals
+                                .entry(contract.clone())
+                                .or_insert_with(ethereum_types::U256::zero) += *amount;
                         }
                     }
                 }
@@ -911,10 +933,12 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                 trx_total_obj.insert("trx".to_string(), json!(sun_to_trx_fixed_18(trx_total_sun)));
 
                 for (contract, amount) in &trc20_totals {
-                    let dec = *decimals_map.get(contract).unwrap_or(&6);
+                    let Some(&dec) = decimals_map.get(contract) else {
+                        continue;
+                    };
                     trx_total_obj.insert(
                         contract.clone(),
-                        json!(u128_base_units_to_fixed_18(*amount, dec)),
+                        json!(u256_base_units_to_fixed_18(*amount, dec)),
                     );
                 }
 
@@ -993,4 +1017,22 @@ async fn mark_job_failed(state: &AppState, request_key: &str) -> Result<(), mong
     ).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ethereum_types::U256;
+
+    #[test]
+    fn tron_token_formatter_keeps_fixed_18_precision() {
+        assert_eq!(
+            u256_base_units_to_fixed_18(U256::from(1_500_000u64), 6),
+            "1.500000000000000000"
+        );
+        assert_eq!(
+            u256_base_units_to_fixed_18(U256::from(1u64), 18),
+            "0.000000000000000001"
+        );
+    }
 }

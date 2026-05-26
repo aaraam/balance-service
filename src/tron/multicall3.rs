@@ -6,6 +6,8 @@
 // over bounded pair-chunks to avoid provider rate-limit bursts.
 
 use futures::stream::{self, StreamExt};
+use ethereum_types::U256;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 use super::rpc::TronRpcClient;
@@ -17,6 +19,7 @@ pub const TRON_TRC20_CONCURRENCY: usize = 6;
 pub const TRON_DECIMALS_CONCURRENCY: usize = 3;
 pub const TRON_PAIR_CHUNK_SIZE: usize = 75;
 pub const TRON_DECIMALS_CHUNK_SIZE: usize = 20;
+const TRON_MAX_SUPPORTED_DECIMALS: u32 = 77;
 
 // Kept for backwards-compatibility with runner.rs import list.
 // The value is now only used as a fallback; functions use their own defaults above.
@@ -37,6 +40,18 @@ fn tron_b58_to_20bytes(b58: &str) -> Option<[u8; 20]> {
     if decoded.len() != 25 {
         return None;
     }
+    if decoded[0] != 0x41 {
+        return None;
+    }
+
+    let payload = &decoded[..21];
+    let checksum = &decoded[21..25];
+    let h1 = Sha256::digest(payload);
+    let h2 = Sha256::digest(h1);
+    if &h2[..4] != checksum {
+        return None;
+    }
+
     let mut out = [0u8; 20];
     out.copy_from_slice(&decoded[1..21]);
     Some(out)
@@ -56,20 +71,37 @@ fn encode_decimals() -> String {
     hex::encode(SELECTOR_DECIMALS)
 }
 
-/// Decode the last 16 bytes of a 32-byte ABI uint return value as u128.
-fn decode_u128_from_returndata(bytes: &[u8]) -> u128 {
-    if bytes.len() < 16 {
-        return 0;
+/// Decode an ABI uint256 return value without truncating large balances.
+fn decode_u256_from_returndata(bytes: &[u8]) -> U256 {
+    if bytes.len() >= 32 {
+        return U256::from_big_endian(&bytes[bytes.len() - 32..]);
     }
-    let start = bytes.len().saturating_sub(16);
-    let mut buf = [0u8; 16];
-    buf.copy_from_slice(&bytes[start..start + 16]);
-    u128::from_be_bytes(buf)
+
+    let mut padded = [0u8; 32];
+    padded[32 - bytes.len()..].copy_from_slice(bytes);
+    U256::from_big_endian(&padded)
 }
 
-/// Decode the last byte of a 32-byte ABI uint8 return value as u8.
-fn decode_u8_from_returndata(bytes: &[u8]) -> u8 {
-    bytes.last().cloned().unwrap_or(18)
+/// Decode a usable token decimals value for the output formatter.
+fn decode_decimals_from_returndata(bytes: &[u8]) -> Option<u32> {
+    if bytes.len() < 32 {
+        return None;
+    }
+    let start = bytes.len().saturating_sub(32);
+    let word = &bytes[start..start + 32];
+
+    if word[..31].iter().any(|&b| b != 0) {
+        tracing::warn!("TRON decimals() returned out-of-range value");
+        return None;
+    }
+
+    let decimals = word[31] as u32;
+    if decimals > TRON_MAX_SUPPORTED_DECIMALS {
+        tracing::warn!(decimals, "TRON decimals() exceeds formatter range");
+        return None;
+    }
+
+    Some(decimals)
 }
 
 // ── public API ────────────────────────────────────────────────────────────────
@@ -118,24 +150,24 @@ pub async fn fetch_native_trx_concurrent(
 /// actual behaviour.
 ///
 /// Per-call errors are swallowed: the (wallet, contract) entry gets 0.
-/// Returns: `HashMap<b58_wallet, HashMap<contract_b58, amount_u128>>`
+/// Returns: `HashMap<b58_wallet, HashMap<contract_b58, amount_u256>>`
 pub async fn fetch_all_tron_balances(
     rpc: &TronRpcClient,
     b58_wallets: &[String],
     trc20_contracts: &[String],
     _concurrency: usize, // kept for API compat
-) -> HashMap<String, HashMap<String, u128>> {
+) -> HashMap<String, HashMap<String, U256>> {
     // Flatten all (wallet, contract) pairs
     let pairs: Vec<(String, String)> = b58_wallets
         .iter()
         .flat_map(|w| trc20_contracts.iter().map(move |c| (w.clone(), c.clone())))
         .collect();
 
-    let mut out: HashMap<String, HashMap<String, u128>> = HashMap::new();
+    let mut out: HashMap<String, HashMap<String, U256>> = HashMap::new();
 
     // Process in chunks to avoid provider bursts
     for chunk in pairs.chunks(TRON_PAIR_CHUNK_SIZE) {
-        let chunk_results: Vec<(String, String, u128)> =
+        let chunk_results: Vec<(String, String, U256)> =
             stream::iter(chunk.iter().cloned())
                 .map(|(wallet, contract)| {
                     let rpc = rpc.clone();
@@ -145,7 +177,7 @@ pub async fn fetch_all_tron_balances(
                                 let data_hex = encode_balance_of(&addr_bytes);
                                 rpc.trigger_constant(&contract, &wallet, &data_hex)
                                     .await
-                                    .map(|bytes: Vec<u8>| decode_u128_from_returndata(&bytes))
+                                    .map(|bytes: Vec<u8>| decode_u256_from_returndata(&bytes))
                                     .unwrap_or_else(|e| {
                                         tracing::warn!(
                                             wallet = %wallet,
@@ -153,7 +185,7 @@ pub async fn fetch_all_tron_balances(
                                             error = %e,
                                             "TRON TRC20 balanceOf failed -> 0"
                                         );
-                                        0
+                                        U256::zero()
                                     })
                             }
                             None => {
@@ -161,7 +193,7 @@ pub async fn fetch_all_tron_balances(
                                     wallet = %wallet,
                                     "TRON b58 decode failed in fetch_all_tron_balances -> 0"
                                 );
-                                0
+                                U256::zero()
                             }
                         };
                         (wallet, contract, amount)
@@ -183,7 +215,7 @@ pub async fn fetch_all_tron_balances(
 /// Contracts are processed in chunks of `TRON_DECIMALS_CHUNK_SIZE` with
 /// `TRON_DECIMALS_CONCURRENCY` concurrent calls per chunk.
 ///
-/// Per-contract errors are swallowed: the contract defaults to 6 decimals.
+/// Per-contract errors are swallowed: no decimals entry is returned for that contract.
 /// Returns: `HashMap<contract_b58, decimals_u32>`
 pub async fn fetch_trc20_decimals(
     rpc: &TronRpcClient,
@@ -197,7 +229,7 @@ pub async fn fetch_trc20_decimals(
     let mut out: HashMap<String, u32> = HashMap::new();
 
     for chunk in trc20_contracts.chunks(TRON_DECIMALS_CHUNK_SIZE) {
-        let chunk_results: Vec<(String, u32)> =
+        let chunk_results: Vec<(String, Option<u32>)> =
             stream::iter(chunk.iter().cloned())
                 .map(|contract| {
                     let rpc = rpc.clone();
@@ -207,14 +239,14 @@ pub async fn fetch_trc20_decimals(
                         let dec = rpc
                             .trigger_constant(&contract, &owner, &data)
                             .await
-                            .map(|bytes: Vec<u8>| decode_u8_from_returndata(&bytes) as u32)
+                            .map(|bytes: Vec<u8>| decode_decimals_from_returndata(&bytes))
                             .unwrap_or_else(|e| {
                                 tracing::warn!(
                                     contract = %contract,
                                     error = %e,
-                                    "TRON decimals() failed -> default 6"
+                                    "TRON decimals() failed; leaving token value unchanged"
                                 );
-                                6
+                                None
                             });
                         (contract, dec)
                     }
@@ -223,10 +255,52 @@ pub async fn fetch_trc20_decimals(
                 .collect()
                 .await;
 
-        out.extend(chunk_results);
+        for (contract, decimals) in chunk_results {
+            if let Some(decimals) = decimals {
+                out.insert(contract, decimals);
+            }
+        }
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tron_address_decoder_checks_checksum() {
+        let payload = [0x11u8; 20];
+        let mut address = vec![0x41];
+        address.extend_from_slice(&payload);
+        let first_hash = Sha256::digest(&address);
+        let second_hash = Sha256::digest(first_hash);
+        address.extend_from_slice(&second_hash[..4]);
+
+        let encoded = bs58::encode(&address).into_string();
+        assert_eq!(tron_b58_to_20bytes(&encoded), Some(payload));
+
+        address[24] ^= 1;
+        let invalid = bs58::encode(address).into_string();
+        assert_eq!(tron_b58_to_20bytes(&invalid), None);
+    }
+
+    #[test]
+    fn balance_decoder_preserves_full_uint256() {
+        let raw = [0xff; 32];
+        assert_eq!(decode_u256_from_returndata(&raw), U256::MAX);
+    }
+
+    #[test]
+    fn decimals_decoder_rejects_unsupported_values() {
+        let mut raw = [0u8; 32];
+        raw[31] = 18;
+        assert_eq!(decode_decimals_from_returndata(&raw), Some(18));
+
+        raw[31] = 78;
+        assert_eq!(decode_decimals_from_returndata(&raw), None);
+    }
 }
 
 
