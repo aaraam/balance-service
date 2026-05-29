@@ -15,6 +15,16 @@ pub async fn health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
+fn cache_key_request(req: &BalanceRequest) -> BalanceRequest {
+    let mut key_req = req.clone();
+    key_req.hard_refresh = false;
+    key_req
+}
+
+fn should_refresh_existing(hard_refresh: bool, existing_is_complete: bool) -> bool {
+    hard_refresh || !existing_is_complete
+}
+
 pub async fn get_job_status(
     State(state): State<AppState>,
     Path(request_key): Path<String>,
@@ -58,7 +68,7 @@ pub async fn get_multi_wallet_balances(
 
     let normalized = normalize_request(&req);
 
-    let canonical_json = match serde_json::to_string(&normalized) {
+    let canonical_json = match serde_json::to_string(&cache_key_request(&normalized)) {
         Ok(s) => s,
         Err(e) => {
             return crate::http::error::ApiError::bad_request(
@@ -78,7 +88,7 @@ pub async fn get_multi_wallet_balances(
     match snap {
         Ok(Some(existing)) => {
             let existing_is_complete = existing.is_complete;
-            let should_refresh = !existing_is_complete;
+            let should_refresh = should_refresh_existing(normalized.hard_refresh, existing_is_complete);
 
             if should_refresh {
                 if let Ok(did_queue) =
@@ -149,5 +159,40 @@ pub async fn get_multi_wallet_balances(
             )
                 .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::dto::ContractGroup;
+
+    #[test]
+    fn cache_key_ignores_hard_refresh_flag() {
+        let mut req = BalanceRequest {
+            hard_refresh: true,
+            contracts: vec![ContractGroup {
+                network_name: "trx".to_string(),
+                contract_addresses: vec!["token".to_string()],
+            }],
+            wallet_addresses: vec!["wallet".to_string()],
+            solana_wallet_addresses: vec![],
+            tron_wallet_addresses: vec![],
+            doge_wallet_addresses: vec![],
+            btc_wallet_addresses: vec![],
+        };
+
+        let hard_refresh_key = serde_json::to_string(&cache_key_request(&req)).unwrap();
+        req.hard_refresh = false;
+        let normal_key = serde_json::to_string(&cache_key_request(&req)).unwrap();
+
+        assert_eq!(hard_refresh_key, normal_key);
+    }
+
+    #[test]
+    fn hard_refresh_requeues_complete_snapshots() {
+        assert!(should_refresh_existing(true, true));
+        assert!(should_refresh_existing(false, false));
+        assert!(!should_refresh_existing(false, true));
     }
 }
