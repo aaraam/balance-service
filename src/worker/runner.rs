@@ -106,7 +106,11 @@ fn u128_base_units_to_fixed_18(value: u128, decimals: u32) -> String {
 
 fn u256_base_units_to_fixed_18(value: ethereum_types::U256, decimals: u32) -> String {
     if decimals == 0 {
-        return format!("{}.{}", value, "0".repeat(18));
+        return format!(
+            "{}.{}",
+            u256_to_decimal_string(value, 0, false),
+            "0".repeat(18)
+        );
     }
 
     let decimal = u256_to_decimal_string(value, decimals, false);
@@ -1034,5 +1038,15 @@ mod tests {
             u256_base_units_to_fixed_18(U256::from(1u64), 18),
             "0.000000000000000001"
         );
+    }
+
+    #[test]
+    fn tron_token_formatter_never_emits_compact_suffixes() {
+        let formatted = u256_base_units_to_fixed_18(U256::from(1_249_453_151_821u64), 0);
+
+        assert_eq!(formatted, "1249453151821.000000000000000000");
+        assert!(formatted
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.'));
     }
 }
