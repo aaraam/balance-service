@@ -1,18 +1,119 @@
 use crate::core::key::request_key_from_canonical_json;
 use crate::core::normalize::normalize_request;
+use crate::core::token_decimals::{
+    fetch_token_decimals, normalize_token_decimals_target, TokenDecimalsValidationError,
+};
 use crate::db::{refresh_jobs, snapshots};
-use crate::http::dto::{zero_result_from_request, BalanceRequest, BalanceResponse};
+use crate::http::dto::{
+    zero_result_from_request, BalanceRequest, BalanceResponse, TokenDecimalsRequest,
+    TokenDecimalsResponse,
+};
+use crate::http::error::ApiErrorBody;
 use crate::http::validate::validate_request_limits;
 use crate::AppState;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     Json,
 };
+use serde_json::json;
 
 pub async fn health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
+}
+
+fn token_decimals_error_response(
+    status: StatusCode,
+    blockchain: impl Into<String>,
+    contract_address: impl Into<String>,
+    code: impl Into<String>,
+    message: impl Into<String>,
+    details: Option<serde_json::Value>,
+) -> Response {
+    (
+        status,
+        Json(TokenDecimalsResponse {
+            status: false,
+            blockchain: blockchain.into(),
+            contract_address: contract_address.into(),
+            exists: false,
+            decimals: None,
+            error: Some(ApiErrorBody {
+                code: code.into(),
+                message: message.into(),
+                details,
+            }),
+        }),
+    )
+        .into_response()
+}
+
+pub async fn get_token_decimals(
+    State(state): State<AppState>,
+    Json(req): Json<TokenDecimalsRequest>,
+) -> impl IntoResponse {
+    let target = match normalize_token_decimals_target(&req.blockchain, &req.contract_address) {
+        Ok(target) => target,
+        Err(e) => {
+            let (code, details) = match &e {
+                TokenDecimalsValidationError::UnsupportedBlockchain(blockchain) => (
+                    "INVALID_BLOCKCHAIN",
+                    Some(json!({ "blockchain": blockchain })),
+                ),
+                TokenDecimalsValidationError::InvalidContractAddress {
+                    blockchain,
+                    contract_address,
+                } => (
+                    "INVALID_CONTRACT",
+                    Some(json!({
+                        "blockchain": blockchain,
+                        "contractAddress": contract_address
+                    })),
+                ),
+            };
+
+            return token_decimals_error_response(
+                StatusCode::BAD_REQUEST,
+                req.blockchain,
+                req.contract_address,
+                code,
+                e.to_string(),
+                details,
+            );
+        }
+    };
+
+    match fetch_token_decimals(&state.cfg, &target).await {
+        Ok(decimals) => (
+            StatusCode::OK,
+            Json(TokenDecimalsResponse {
+                status: true,
+                blockchain: target.blockchain,
+                contract_address: target.contract_address,
+                exists: decimals.is_some(),
+                decimals,
+                error: None,
+            }),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(
+                blockchain = %target.blockchain,
+                contract = %target.contract_address,
+                error = %e,
+                "token decimals lookup failed"
+            );
+            token_decimals_error_response(
+                StatusCode::BAD_GATEWAY,
+                target.blockchain,
+                target.contract_address,
+                "TOKEN_DECIMALS_LOOKUP_FAILED",
+                e.to_string(),
+                None,
+            )
+        }
+    }
 }
 
 fn cache_key_request(req: &BalanceRequest) -> BalanceRequest {

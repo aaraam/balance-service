@@ -34,6 +34,29 @@ pub struct BalanceRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenDecimalsRequest {
+    #[serde(alias = "networkName", alias = "network", alias = "chain")]
+    pub blockchain: String,
+
+    #[serde(alias = "contract_address", alias = "address")]
+    pub contract_address: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenDecimalsResponse {
+    pub status: bool,
+    pub blockchain: String,
+    pub contract_address: String,
+    pub exists: bool,
+    pub decimals: Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ApiErrorBody>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BalanceResponse {
     pub status: bool,
 

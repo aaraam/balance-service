@@ -57,6 +57,10 @@ async fn main() -> Result<(), anyhow::Error> {
     let app = Router::new()
         .route("/health", get(http::handlers::health))
         .route(
+            "/token/get-decimals",
+            post(http::handlers::get_token_decimals),
+        )
+        .route(
             "/wallet/get-multi-wallet-balances",
             post(http::handlers::get_multi_wallet_balances),
         )

@@ -265,6 +265,33 @@ pub async fn fetch_trc20_decimals(
     out
 }
 
+/// Fetch `decimals()` for one TRC20 contract.
+///
+/// `triggerconstantcontract` requires an owner address even for view calls. The
+/// contract address is itself a valid TRON address, so it is used as the caller.
+/// A failed call means the address could not be proven to expose TRC20 decimals.
+pub async fn fetch_single_trc20_decimals(
+    rpc: &TronRpcClient,
+    contract_b58: &str,
+) -> Result<Option<u32>, anyhow::Error> {
+    let data = encode_decimals();
+
+    match rpc
+        .trigger_constant(contract_b58, contract_b58, &data)
+        .await
+    {
+        Ok(bytes) => Ok(decode_decimals_from_returndata(&bytes)),
+        Err(e) => {
+            tracing::warn!(
+                contract = %contract_b58,
+                error = %e,
+                "TRON decimals() failed; treating token as not found"
+            );
+            Ok(None)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,5 +329,3 @@ mod tests {
         assert_eq!(decode_decimals_from_returndata(&raw), None);
     }
 }
-
-

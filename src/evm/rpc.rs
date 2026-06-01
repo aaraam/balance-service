@@ -54,4 +54,33 @@ impl RpcClient {
 
         Ok(result.to_string())
     }
+
+    pub async fn eth_get_code(&self, address: &str) -> Result<String, anyhow::Error> {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_getCode",
+            "params": [address, "latest"]
+        });
+
+        let res = self.http.post(&self.rpc_url).json(&payload).send().await?;
+
+        let status = res.status();
+        let v: serde_json::Value = res.json().await?;
+
+        if !status.is_success() {
+            return Err(anyhow!("rpc http error: status={} body={}", status, v));
+        }
+
+        if let Some(err) = v.get("error") {
+            return Err(anyhow!("rpc error: {}", err));
+        }
+
+        let result = v
+            .get("result")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| anyhow!("missing rpc result: {}", v))?;
+
+        Ok(result.to_string())
+    }
 }
