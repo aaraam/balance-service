@@ -5,8 +5,8 @@
 // and TronRpcClient::getaccount_balance_sun. Concurrency is managed with buffer_unordered
 // over bounded pair-chunks to avoid provider rate-limit bursts.
 
-use futures::stream::{self, StreamExt};
 use ethereum_types::U256;
+use futures::stream::{self, StreamExt};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
@@ -167,41 +167,40 @@ pub async fn fetch_all_tron_balances(
 
     // Process in chunks to avoid provider bursts
     for chunk in pairs.chunks(TRON_PAIR_CHUNK_SIZE) {
-        let chunk_results: Vec<(String, String, U256)> =
-            stream::iter(chunk.iter().cloned())
-                .map(|(wallet, contract)| {
-                    let rpc = rpc.clone();
-                    async move {
-                        let amount = match tron_b58_to_20bytes(&wallet) {
-                            Some(addr_bytes) => {
-                                let data_hex = encode_balance_of(&addr_bytes);
-                                rpc.trigger_constant(&contract, &wallet, &data_hex)
-                                    .await
-                                    .map(|bytes: Vec<u8>| decode_u256_from_returndata(&bytes))
-                                    .unwrap_or_else(|e| {
-                                        tracing::warn!(
-                                            wallet = %wallet,
-                                            contract = %contract,
-                                            error = %e,
-                                            "TRON TRC20 balanceOf failed -> 0"
-                                        );
-                                        U256::zero()
-                                    })
-                            }
-                            None => {
-                                tracing::warn!(
-                                    wallet = %wallet,
-                                    "TRON b58 decode failed in fetch_all_tron_balances -> 0"
-                                );
-                                U256::zero()
-                            }
-                        };
-                        (wallet, contract, amount)
-                    }
-                })
-                .buffer_unordered(TRON_TRC20_CONCURRENCY)
-                .collect()
-                .await;
+        let chunk_results: Vec<(String, String, U256)> = stream::iter(chunk.iter().cloned())
+            .map(|(wallet, contract)| {
+                let rpc = rpc.clone();
+                async move {
+                    let amount = match tron_b58_to_20bytes(&wallet) {
+                        Some(addr_bytes) => {
+                            let data_hex = encode_balance_of(&addr_bytes);
+                            rpc.trigger_constant(&contract, &wallet, &data_hex)
+                                .await
+                                .map(|bytes: Vec<u8>| decode_u256_from_returndata(&bytes))
+                                .unwrap_or_else(|e| {
+                                    tracing::warn!(
+                                        wallet = %wallet,
+                                        contract = %contract,
+                                        error = %e,
+                                        "TRON TRC20 balanceOf failed -> 0"
+                                    );
+                                    U256::zero()
+                                })
+                        }
+                        None => {
+                            tracing::warn!(
+                                wallet = %wallet,
+                                "TRON b58 decode failed in fetch_all_tron_balances -> 0"
+                            );
+                            U256::zero()
+                        }
+                    };
+                    (wallet, contract, amount)
+                }
+            })
+            .buffer_unordered(TRON_TRC20_CONCURRENCY)
+            .collect()
+            .await;
 
         for (wallet, contract, amount) in chunk_results {
             out.entry(wallet).or_default().insert(contract, amount);
@@ -229,31 +228,30 @@ pub async fn fetch_trc20_decimals(
     let mut out: HashMap<String, u32> = HashMap::new();
 
     for chunk in trc20_contracts.chunks(TRON_DECIMALS_CHUNK_SIZE) {
-        let chunk_results: Vec<(String, Option<u32>)> =
-            stream::iter(chunk.iter().cloned())
-                .map(|contract| {
-                    let rpc = rpc.clone();
-                    let owner = owner.clone();
-                    let data = call_data.clone();
-                    async move {
-                        let dec = rpc
-                            .trigger_constant(&contract, &owner, &data)
-                            .await
-                            .map(|bytes: Vec<u8>| decode_decimals_from_returndata(&bytes))
-                            .unwrap_or_else(|e| {
-                                tracing::warn!(
-                                    contract = %contract,
-                                    error = %e,
-                                    "TRON decimals() failed; leaving token value unchanged"
-                                );
-                                None
-                            });
-                        (contract, dec)
-                    }
-                })
-                .buffer_unordered(TRON_DECIMALS_CONCURRENCY)
-                .collect()
-                .await;
+        let chunk_results: Vec<(String, Option<u32>)> = stream::iter(chunk.iter().cloned())
+            .map(|contract| {
+                let rpc = rpc.clone();
+                let owner = owner.clone();
+                let data = call_data.clone();
+                async move {
+                    let dec = rpc
+                        .trigger_constant(&contract, &owner, &data)
+                        .await
+                        .map(|bytes: Vec<u8>| decode_decimals_from_returndata(&bytes))
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(
+                                contract = %contract,
+                                error = %e,
+                                "TRON decimals() failed; leaving token value unchanged"
+                            );
+                            None
+                        });
+                    (contract, dec)
+                }
+            })
+            .buffer_unordered(TRON_DECIMALS_CONCURRENCY)
+            .collect()
+            .await;
 
         for (contract, decimals) in chunk_results {
             if let Some(decimals) = decimals {

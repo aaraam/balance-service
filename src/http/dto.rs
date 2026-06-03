@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
 use crate::core::chains_meta::native_symbol_for;
 use crate::http::error::ApiErrorBody;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -96,14 +96,16 @@ pub fn zero_result_from_request(req: &BalanceRequest) -> serde_json::Value {
     use serde_json::json;
     use serde_json::Map;
 
-    let sol_mints = req.contracts
+    let sol_mints = req
+        .contracts
         .iter()
         .find(|c| c.network_name == "sol")
         .map(|c| c.contract_addresses.clone())
         .unwrap_or_default();
 
     let trc20_contracts = trc20_contracts_from_request(req);
-    let has_trx = !trc20_contracts.is_empty() || req.contracts.iter().any(|c| c.network_name == "trx");
+    let has_trx =
+        !trc20_contracts.is_empty() || req.contracts.iter().any(|c| c.network_name == "trx");
 
     let mut data: Vec<serde_json::Value> = Vec::new();
 
@@ -115,7 +117,9 @@ pub fn zero_result_from_request(req: &BalanceRequest) -> serde_json::Value {
         for cg in &req.contracts {
             let net = cg.network_name.as_str();
 
-            if net == "sol" || net == "trx" { continue; }
+            if net == "sol" || net == "trx" {
+                continue;
+            }
 
             let mut net_obj: Map<String, serde_json::Value> = Map::new();
 
@@ -157,8 +161,10 @@ pub fn zero_result_from_request(req: &BalanceRequest) -> serde_json::Value {
     for cg in &req.contracts {
         let net = cg.network_name.as_str();
 
-        if net == "sol" || net == "trx" { continue; }
-        
+        if net == "sol" || net == "trx" {
+            continue;
+        }
+
         let mut net_obj: Map<String, serde_json::Value> = Map::new();
 
         net_obj.insert(native_symbol_for(net).to_string(), json!(ZERO_18));

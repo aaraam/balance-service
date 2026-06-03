@@ -172,12 +172,8 @@ pub async fn get_multi_wallet_balances(
     let canonical_json = match serde_json::to_string(&cache_key_request(&normalized)) {
         Ok(s) => s,
         Err(e) => {
-            return crate::http::error::ApiError::bad_request(
-                "JSON_ERROR",
-                &e.to_string(),
-                None,
-            )
-            .into_response();
+            return crate::http::error::ApiError::bad_request("JSON_ERROR", &e.to_string(), None)
+                .into_response();
         }
     };
 
@@ -189,7 +185,8 @@ pub async fn get_multi_wallet_balances(
     match snap {
         Ok(Some(existing)) => {
             let existing_is_complete = existing.is_complete;
-            let should_refresh = should_refresh_existing(normalized.hard_refresh, existing_is_complete);
+            let should_refresh =
+                should_refresh_existing(normalized.hard_refresh, existing_is_complete);
 
             if should_refresh {
                 if let Ok(did_queue) =
@@ -238,8 +235,7 @@ pub async fn get_multi_wallet_balances(
             {
                 if did_queue {
                     let _ =
-                        snapshots::set_refresh_state(&state.mongo.db, &request_key, "queued")
-                            .await;
+                        snapshots::set_refresh_state(&state.mongo.db, &request_key, "queued").await;
                     if let Err(e) = state.queue.publish(&request_key).await {
                         tracing::error!(request_key=%request_key, error=%e, "failed to publish job to queue");
                     }

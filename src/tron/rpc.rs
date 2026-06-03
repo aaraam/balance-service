@@ -74,9 +74,7 @@ impl TronRpcClient {
         }
 
         let clean = s.strip_prefix("0x").unwrap_or(s);
-        if !clean.is_empty()
-            && clean.len() % 2 == 0
-            && clean.chars().all(|c| c.is_ascii_hexdigit())
+        if !clean.is_empty() && clean.len() % 2 == 0 && clean.chars().all(|c| c.is_ascii_hexdigit())
         {
             if let Ok(bytes) = hex::decode(clean) {
                 return Ok(bytes);
@@ -103,7 +101,11 @@ impl TronRpcClient {
         } else {
             (&self.fullnode_url, false)
         };
-        let path_segment = if use_solidity { "walletsolidity" } else { "wallet" };
+        let path_segment = if use_solidity {
+            "walletsolidity"
+        } else {
+            "wallet"
+        };
         let url = format!("{}/{}/triggerconstantcontract", base_url, path_segment);
 
         let payload = json!({
@@ -138,8 +140,8 @@ impl TronRpcClient {
             ));
         }
 
-        let raw = raw_opt
-            .ok_or_else(|| anyhow!("TRON constant_result missing or empty | body={}", v))?;
+        let raw =
+            raw_opt.ok_or_else(|| anyhow!("TRON constant_result missing or empty | body={}", v))?;
 
         Self::decode_constant_result(raw)
     }
@@ -151,5 +153,3 @@ impl TronRpcClient {
         Ok(v.get("balance").and_then(|x| x.as_u64()).unwrap_or(0))
     }
 }
-
-

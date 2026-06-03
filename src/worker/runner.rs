@@ -363,7 +363,10 @@ async fn run_worker_mongo_fallback(state: AppState) {
 }
 
 async fn claim_next_job(state: &AppState) -> Result<Option<String>, mongodb::error::Error> {
-    let coll = state.mongo.db.collection::<bson::Document>("balance_refresh_jobs");
+    let coll = state
+        .mongo
+        .db
+        .collection::<bson::Document>("balance_refresh_jobs");
     let now = DateTime::now();
 
     let filter = doc! {
@@ -383,20 +386,30 @@ async fn claim_next_job(state: &AppState) -> Result<Option<String>, mongodb::err
         .return_document(ReturnDocument::After)
         .build();
 
-    let doc_opt = coll.find_one_and_update(filter, update).with_options(opts).await?;
+    let doc_opt = coll
+        .find_one_and_update(filter, update)
+        .with_options(opts)
+        .await?;
     Ok(doc_opt.and_then(|d| d.get_str("requestKey").ok().map(|s| s.to_string())))
 }
 
 async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::Error> {
-    let snapshots = state.mongo.db.collection::<bson::Document>("balance_snapshots");
+    let snapshots = state
+        .mongo
+        .db
+        .collection::<bson::Document>("balance_snapshots");
     let now = DateTime::now();
 
-    snapshots.update_one(
-        doc! { "requestKey": request_key },
-        doc! { "$set": { "refreshState": "running", "isComplete": false } },
-    ).await?;
+    snapshots
+        .update_one(
+            doc! { "requestKey": request_key },
+            doc! { "$set": { "refreshState": "running", "isComplete": false } },
+        )
+        .await?;
 
-    let snap = snapshots.find_one(doc! { "requestKey": request_key }).await?
+    let snap = snapshots
+        .find_one(doc! { "requestKey": request_key })
+        .await?
         .ok_or_else(|| anyhow!("snapshot not found for requestKey"))?;
 
     let initial_result_json: serde_json::Value = snap
@@ -625,9 +638,15 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
 
     // Persist EVM results immediately — SOL and TRON do not block clients from
     // seeing EVM balances anymore.
-    persist_partial_result(&snapshots, request_key, &final_result, &req_sanitized_json, "evm_done")
-        .await
-        .unwrap_or_else(|e| tracing::warn!(error = %e, "partial persist after EVM failed (non-fatal)"));
+    persist_partial_result(
+        &snapshots,
+        request_key,
+        &final_result,
+        &req_sanitized_json,
+        "evm_done",
+    )
+    .await
+    .unwrap_or_else(|e| tracing::warn!(error = %e, "partial persist after EVM failed (non-fatal)"));
 
     // ==========================
     // SOL processing
@@ -635,12 +654,15 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
     if !req.solana_wallet_addresses.is_empty() {
         let sol_start = Instant::now();
 
-        let sol_rpc = SolanaRpcClient::new(state.cfg.solana_rpc_url.clone(), state.cfg.rpc_timeout_ms);
+        let sol_rpc =
+            SolanaRpcClient::new(state.cfg.solana_rpc_url.clone(), state.cfg.rpc_timeout_ms);
         let sol_mints = sol_mints_from_request(&req);
 
         let mut sol_total_lamports: u128 = 0;
-        let mut spl_totals: std::collections::HashMap<String, u128> = std::collections::HashMap::new();
-        let mut spl_decimals: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut spl_totals: std::collections::HashMap<String, u128> =
+            std::collections::HashMap::new();
+        let mut spl_decimals: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
 
         for w in &req.solana_wallet_addresses {
             let row_idx = *sol_wallet_index
@@ -780,15 +802,22 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
     }
 
     // Persist EVM + SOL so the client sees these immediately, before TRON runs.
-    persist_partial_result(&snapshots, request_key, &final_result, &req_sanitized_json, "sol_done")
-        .await
-        .unwrap_or_else(|e| tracing::warn!(error = %e, "partial persist after SOL failed (non-fatal)"));
+    persist_partial_result(
+        &snapshots,
+        request_key,
+        &final_result,
+        &req_sanitized_json,
+        "sol_done",
+    )
+    .await
+    .unwrap_or_else(|e| tracing::warn!(error = %e, "partial persist after SOL failed (non-fatal)"));
 
     // ==========================
     // TRON processing (Derived from EVM)
     // ==========================
     let trc20_contracts = trc20_contracts_from_request(&req);
-    let has_trx = !trc20_contracts.is_empty() || req.contracts.iter().any(|c| c.network_name == "trx");
+    let has_trx =
+        !trc20_contracts.is_empty() || req.contracts.iter().any(|c| c.network_name == "trx");
 
     if has_trx && !req.wallet_addresses.is_empty() {
         let tron_rpc = TronRpcClient::new(
@@ -840,38 +869,33 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         // never holds EVM/SOL results hostage.
         let tron_start = Instant::now();
         let tron_phase = async {
-            let native_balances = fetch_native_trx_concurrent(
-                &tron_rpc,
-                &b58_wallets,
-                TRON_NATIVE_CONCURRENCY,
-            )
-            .await;
+            let native_balances =
+                fetch_native_trx_concurrent(&tron_rpc, &b58_wallets, TRON_NATIVE_CONCURRENCY).await;
 
-            let trc20_balances: HashMap<String, HashMap<String, ethereum_types::U256>> =
-                if do_trc20 {
-                    fetch_all_tron_balances(
-                        &tron_rpc,
-                        &b58_wallets,
-                        &effective_contracts,
-                        MAX_TRON_CALLS_PER_BATCH,
-                    )
-                    .await
-                } else {
-                    HashMap::new()
-                };
+            let trc20_balances: HashMap<String, HashMap<String, ethereum_types::U256>> = if do_trc20
+            {
+                fetch_all_tron_balances(
+                    &tron_rpc,
+                    &b58_wallets,
+                    &effective_contracts,
+                    MAX_TRON_CALLS_PER_BATCH,
+                )
+                .await
+            } else {
+                HashMap::new()
+            };
 
-            let decimals_map: HashMap<String, u32> =
-                if do_trc20 && !b58_wallets.is_empty() {
-                    fetch_trc20_decimals(
-                        &tron_rpc,
-                        &effective_contracts,
-                        &b58_wallets[0],
-                        MAX_TRON_CALLS_PER_BATCH,
-                    )
-                    .await
-                } else {
-                    HashMap::new()
-                };
+            let decimals_map: HashMap<String, u32> = if do_trc20 && !b58_wallets.is_empty() {
+                fetch_trc20_decimals(
+                    &tron_rpc,
+                    &effective_contracts,
+                    &b58_wallets[0],
+                    MAX_TRON_CALLS_PER_BATCH,
+                )
+                .await
+            } else {
+                HashMap::new()
+            };
 
             (native_balances, trc20_balances, decimals_map)
         };
@@ -896,7 +920,10 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                         .unwrap();
 
                     let row = data_arr.get_mut(*row_idx).unwrap();
-                    let bal_obj = row.get_mut("balance").and_then(|v| v.as_object_mut()).unwrap();
+                    let bal_obj = row
+                        .get_mut("balance")
+                        .and_then(|v| v.as_object_mut())
+                        .unwrap();
 
                     let trx_obj = bal_obj
                         .entry("trx".to_string())
@@ -984,24 +1011,32 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         }
     ).await?;
 
-    let jobs = state.mongo.db.collection::<bson::Document>("balance_refresh_jobs");
+    let jobs = state
+        .mongo
+        .db
+        .collection::<bson::Document>("balance_refresh_jobs");
     jobs.update_one(
         doc! { "requestKey": request_key },
         doc! { "$set": { "status": "done", "updatedAt": now } },
-    ).await?;
+    )
+    .await?;
 
     Ok(())
 }
 
 async fn mark_job_failed(state: &AppState, request_key: &str) -> Result<(), mongodb::error::Error> {
-    let jobs = state.mongo.db.collection::<bson::Document>("balance_refresh_jobs");
+    let jobs = state
+        .mongo
+        .db
+        .collection::<bson::Document>("balance_refresh_jobs");
     let now = DateTime::now();
     let job = jobs.find_one(doc! { "requestKey": request_key }).await?;
 
     let attempts = job
         .as_ref()
         .and_then(|d| d.get_i32("attempts").ok())
-        .unwrap_or(0) + 1;
+        .unwrap_or(0)
+        + 1;
 
     let backoff_secs = (attempts as i64) * 5;
     let next_retry_ms = now.timestamp_millis() + backoff_secs * 1000;
@@ -1018,7 +1053,8 @@ async fn mark_job_failed(state: &AppState, request_key: &str) -> Result<(), mong
             "$setOnInsert": { "createdAt": now },
             "$inc": { "attempts": 1 }
         },
-    ).await?;
+    )
+    .await?;
 
     Ok(())
 }
@@ -1045,8 +1081,6 @@ mod tests {
         let formatted = u256_base_units_to_fixed_18(U256::from(1_249_453_151_821u64), 0);
 
         assert_eq!(formatted, "1249453151821.000000000000000000");
-        assert!(formatted
-            .chars()
-            .all(|c| c.is_ascii_digit() || c == '.'));
+        assert!(formatted.chars().all(|c| c.is_ascii_digit() || c == '.'));
     }
 }

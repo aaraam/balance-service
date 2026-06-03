@@ -313,26 +313,34 @@ mod tests {
     #[test]
     fn errors_on_empty_or_unsupported_blockchain() {
         let err = normalize_token_decimals_target("", "0x123").unwrap_err();
-        assert!(matches!(err, TokenDecimalsValidationError::UnsupportedBlockchain(b) if b.is_empty()));
+        assert!(
+            matches!(err, TokenDecimalsValidationError::UnsupportedBlockchain(b) if b.is_empty())
+        );
 
         let err = normalize_token_decimals_target("   ", "0x123").unwrap_err();
-        assert!(matches!(err, TokenDecimalsValidationError::UnsupportedBlockchain(b) if b.is_empty()));
+        assert!(
+            matches!(err, TokenDecimalsValidationError::UnsupportedBlockchain(b) if b.is_empty())
+        );
 
         let err = normalize_token_decimals_target("foo", "0x123").unwrap_err();
-        assert!(matches!(err, TokenDecimalsValidationError::UnsupportedBlockchain(b) if b == "foo"));
+        assert!(
+            matches!(err, TokenDecimalsValidationError::UnsupportedBlockchain(b) if b == "foo")
+        );
 
         let err = normalize_token_decimals_target("unknownchain", "0xabc").unwrap_err();
-        assert!(matches!(err, TokenDecimalsValidationError::UnsupportedBlockchain(b) if b == "unknownchain"));
+        assert!(
+            matches!(err, TokenDecimalsValidationError::UnsupportedBlockchain(b) if b == "unknownchain")
+        );
     }
 
     #[test]
     fn errors_on_invalid_evm_contract_addresses() {
         let bad_cases = vec![
-            "0x123".to_string(),                    // too short
-            "0x".to_string() + &"g".repeat(40),     // invalid hex
-            "1".repeat(39),                         // wrong length
-            "0x".to_string() + &"0".repeat(39),     // 39 hex chars
-            "".to_string(),                         // empty
+            "0x123".to_string(),                // too short
+            "0x".to_string() + &"g".repeat(40), // invalid hex
+            "1".repeat(39),                     // wrong length
+            "0x".to_string() + &"0".repeat(39), // 39 hex chars
+            "".to_string(),                     // empty
         ];
 
         for addr in bad_cases {
@@ -419,8 +427,12 @@ mod tests {
     #[ignore = "requires THIRD_WEB_CLIENT_ID + network; run with `cargo test -- --ignored` when env is set"]
     async fn live_e2e_eth_usdt_decimals() {
         let cfg = build_minimal_live_config();
-        let target = normalize_token_decimals_target("eth", "0xdAC17F958D2ee523a2206206994597C13D831ec7").unwrap();
-        let dec = fetch_token_decimals(&cfg, &target).await.expect("ETH USDT live call failed");
+        let target =
+            normalize_token_decimals_target("eth", "0xdAC17F958D2ee523a2206206994597C13D831ec7")
+                .unwrap();
+        let dec = fetch_token_decimals(&cfg, &target)
+            .await
+            .expect("ETH USDT live call failed");
         assert_eq!(dec, Some(6), "ETH USDT should be 6 decimals");
     }
 
@@ -428,8 +440,12 @@ mod tests {
     #[ignore = "requires THIRD_WEB_CLIENT_ID + network; run with `cargo test -- --ignored` when env is set"]
     async fn live_e2e_bnb_usdt_decimals() {
         let cfg = build_minimal_live_config();
-        let target = normalize_token_decimals_target("bnb", "0x55d398326f99059ff775485246999027b3197955").unwrap();
-        let dec = fetch_token_decimals(&cfg, &target).await.expect("BNB USDT live call failed");
+        let target =
+            normalize_token_decimals_target("bnb", "0x55d398326f99059ff775485246999027b3197955")
+                .unwrap();
+        let dec = fetch_token_decimals(&cfg, &target)
+            .await
+            .expect("BNB USDT live call failed");
         assert_eq!(dec, Some(18), "BNB USDT should be 18 decimals");
     }
 
@@ -437,8 +453,12 @@ mod tests {
     #[ignore = "requires THIRD_WEB_CLIENT_ID + network; run with `cargo test -- --ignored` when env is set"]
     async fn live_e2e_sol_usdc_decimals() {
         let cfg = build_minimal_live_config();
-        let target = normalize_token_decimals_target("sol", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap();
-        let dec = fetch_token_decimals(&cfg, &target).await.expect("Solana USDC live call failed");
+        let target =
+            normalize_token_decimals_target("sol", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+                .unwrap();
+        let dec = fetch_token_decimals(&cfg, &target)
+            .await
+            .expect("Solana USDC live call failed");
         assert_eq!(dec, Some(6), "Solana USDC should be 6 decimals");
     }
 
@@ -450,8 +470,11 @@ mod tests {
             eprintln!("Skipping Tron live test - no TRON_*_URL set");
             return;
         }
-        let target = normalize_token_decimals_target("trx", "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t").unwrap();
-        let dec = fetch_token_decimals(&cfg, &target).await.expect("Tron USDT live call failed");
+        let target =
+            normalize_token_decimals_target("trx", "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t").unwrap();
+        let dec = fetch_token_decimals(&cfg, &target)
+            .await
+            .expect("Tron USDT live call failed");
         assert_eq!(dec, Some(6), "Tron USDT (TRC20) should be 6 decimals");
     }
 
@@ -459,8 +482,15 @@ mod tests {
     #[ignore = "requires THIRD_WEB_CLIENT_ID + network; run with `cargo test -- --ignored` when env is set"]
     async fn live_e2e_nonexistent_evm_contract() {
         let cfg = build_minimal_live_config();
-        let target = normalize_token_decimals_target("eth", "0x0000000000000000000000000000000000000001").unwrap();
-        let dec = fetch_token_decimals(&cfg, &target).await.expect("EVM nonexistent call failed");
-        assert_eq!(dec, None, "Random EOA / no-code address should return None (exists=false)");
+        let target =
+            normalize_token_decimals_target("eth", "0x0000000000000000000000000000000000000001")
+                .unwrap();
+        let dec = fetch_token_decimals(&cfg, &target)
+            .await
+            .expect("EVM nonexistent call failed");
+        assert_eq!(
+            dec, None,
+            "Random EOA / no-code address should return None (exists=false)"
+        );
     }
 }

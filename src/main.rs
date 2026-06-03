@@ -4,10 +4,10 @@ mod core;
 mod db;
 mod evm;
 mod http;
+mod queue;
 mod solana;
 mod tron;
 mod worker;
-mod queue;
 
 use axum::{
     routing::{get, post},

@@ -89,7 +89,7 @@ pub fn normalize_request(req: &BalanceRequest) -> BalanceRequest {
         .map(|w| w.trim().to_lowercase())
         .filter(|w| is_valid_evm_h160(w))
         .collect();
-    
+
     wallet_addresses.sort();
     wallet_addresses.dedup();
 
@@ -100,7 +100,7 @@ pub fn normalize_request(req: &BalanceRequest) -> BalanceRequest {
         .map(|w| w.trim().to_string())
         .filter(|w| is_valid_solana_pubkey_32(w))
         .collect();
-        
+
     sol_wallets.sort();
     sol_wallets.dedup();
 
@@ -128,7 +128,9 @@ pub fn normalize_request(req: &BalanceRequest) -> BalanceRequest {
                     .collect();
                 addrs.sort();
                 addrs.dedup();
-                return if addrs.is_empty() { None } else {
+                return if addrs.is_empty() {
+                    None
+                } else {
                     Some(ContractGroup {
                         network_name: net,
                         contract_addresses: addrs,
@@ -145,7 +147,9 @@ pub fn normalize_request(req: &BalanceRequest) -> BalanceRequest {
                     .collect();
                 addrs.sort();
                 addrs.dedup();
-                return if addrs.is_empty() { None } else {
+                return if addrs.is_empty() {
+                    None
+                } else {
                     Some(ContractGroup {
                         network_name: net,
                         contract_addresses: addrs,
