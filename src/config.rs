@@ -28,6 +28,7 @@ pub struct AppConfig {
 
     // Solana (native + SPL via getTokenAccountsByOwner)
     pub solana_rpc_url: String,
+    pub solana_rpc_concurrency: usize,
 
     // NEW: outbound HTTP timeout for RPC calls (EVM + SOL)
     pub rpc_timeout_ms: u64,
@@ -36,6 +37,12 @@ pub struct AppConfig {
     pub tron_fullnode_url: String,
     pub tron_solidity_url: String,
     pub tron_api_key: Option<String>,
+
+    // Market prices
+    pub crypto_market_price_url: String,
+    pub crypto_market_price_refresh_interval_secs: u64,
+    pub coingecko_api_base_url: String,
+    pub coingecko_api_key: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -102,6 +109,13 @@ impl AppConfig {
         let solana_rpc_url = std::env::var("SOLANA_RPC_URL")
             .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
 
+        let solana_rpc_concurrency = std::env::var("SOL_WORKER_RPC_CONCURRENCY")
+            .or_else(|_| std::env::var("SOLANA_RPC_CONCURRENCY"))
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(16)
+            .max(1);
+
         let rpc_timeout_ms = std::env::var("RPC_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -114,6 +128,22 @@ impl AppConfig {
         let tron_api_key = std::env::var("TRON_API_KEY")
             .ok()
             .or_else(|| std::env::var("TRON_TEMP_KEY").ok());
+
+        let crypto_market_price_url = std::env::var("CRYPTO_MARKET_PRICE_URL")
+            .unwrap_or_else(|_| "https://api.techbank.live/v2/crypto-market-price".to_string());
+
+        let crypto_market_price_refresh_interval_secs =
+            std::env::var("CRYPTO_MARKET_PRICE_REFRESH_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(1_800);
+
+        let coingecko_api_base_url = std::env::var("COINGECKO_API_BASE_URL")
+            .unwrap_or_else(|_| "https://api.coingecko.com/api/v3".to_string());
+
+        let coingecko_api_key = std::env::var("COINGECKO_API_KEY")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
 
         Ok(Self {
             bind_addr,
@@ -131,10 +161,15 @@ impl AppConfig {
             nats_max_ack_pending,
             nats_ack_wait_secs,
             solana_rpc_url,
+            solana_rpc_concurrency,
             rpc_timeout_ms,
             tron_fullnode_url,
             tron_solidity_url,
             tron_api_key,
+            crypto_market_price_url,
+            crypto_market_price_refresh_interval_secs,
+            coingecko_api_base_url,
+            coingecko_api_key,
         })
     }
 }

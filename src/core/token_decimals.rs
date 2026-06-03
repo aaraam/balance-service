@@ -414,12 +414,17 @@ mod tests {
                 .expect("THIRD_WEB_CLIENT_ID must be set for live E2E tests"),
             solana_rpc_url: std::env::var("SOLANA_RPC_URL")
                 .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string()),
+            solana_rpc_concurrency: 16,
             rpc_timeout_ms: 20_000,
             tron_fullnode_url: std::env::var("TRON_FULLNODE_URL").unwrap_or_default(),
             tron_solidity_url: std::env::var("TRON_SOLIDITY_URL").unwrap_or_default(),
             tron_api_key: std::env::var("TRON_API_KEY")
                 .ok()
                 .or_else(|| std::env::var("TRON_TEMP_KEY").ok()),
+            crypto_market_price_url: "https://api.techbank.live/v2/crypto-market-price".to_string(),
+            crypto_market_price_refresh_interval_secs: 1_800,
+            coingecko_api_base_url: "https://api.coingecko.com/api/v3".to_string(),
+            coingecko_api_key: std::env::var("COINGECKO_API_KEY").ok(),
         }
     }
 

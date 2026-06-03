@@ -33,3 +33,71 @@ pub struct BalanceRefreshJobDoc {
     pub created_at: DateTime,
     pub updated_at: DateTime,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CryptoMarketPriceAssetDoc {
+    pub id: String,
+    pub symbol: String,
+    pub current_price: String,
+    pub price_change_percentage_24h: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_address: Option<String>,
+
+    #[serde(default)]
+    pub token_addresses: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CryptoMarketPriceDoc {
+    pub currency: String,
+    pub source_url: String,
+    pub source_count: i32,
+    pub count: i32,
+    pub assets: Vec<CryptoMarketPriceAssetDoc>,
+    pub fetched_at: DateTime,
+    pub updated_at: DateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CryptoMarketTrackedTokenDoc {
+    pub currency: String,
+    pub tracking_key: String,
+    pub coingecko_id: String,
+    pub symbol: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset_platform_id: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contract_address: Option<String>,
+
+    #[serde(default)]
+    pub token_addresses: Vec<String>,
+
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenDecimalsCacheDoc {
+    pub blockchain: String,
+    pub contract_address: String,
+    pub exists: bool,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decimals: Option<u32>,
+
+    pub updated_at: DateTime,
+}
+
+fn default_true() -> bool {
+    true
+}

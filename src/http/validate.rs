@@ -253,3 +253,46 @@ fn is_valid_solana_pubkey_32(s: &str) -> bool {
     };
     decoded.len() == 32
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_evm_address(n: u8) -> String {
+        format!("0x{:040x}", n)
+    }
+
+    fn req_with_work_units(evm_wallets: usize, evm_tokens: usize) -> BalanceRequest {
+        BalanceRequest {
+            hard_refresh: false,
+            contracts: vec![ContractGroup {
+                network_name: "eth".to_string(),
+                contract_addresses: (0..evm_tokens)
+                    .map(|i| format!("0x{:040x}", i + 1000))
+                    .collect(),
+            }],
+            wallet_addresses: (0..evm_wallets)
+                .map(|i| valid_evm_address(i as u8))
+                .collect(),
+            solana_wallet_addresses: vec![],
+            tron_wallet_addresses: vec![],
+            doge_wallet_addresses: vec![],
+            btc_wallet_addresses: vec![],
+        }
+    }
+
+    #[test]
+    fn normalized_validation_rejects_oversized_evm_work_units() {
+        let req = req_with_work_units(101, 100);
+        let err = validate_normalized_request(&req).unwrap_err();
+
+        assert_eq!(err.body.code, "INVALID_REQUEST_LIMITS");
+        assert_eq!(err.body.details.unwrap()["work_units"], json!(10_100));
+    }
+
+    #[test]
+    fn normalized_validation_allows_evm_work_units_at_limit() {
+        let req = req_with_work_units(100, 100);
+        validate_normalized_request(&req).unwrap();
+    }
+}

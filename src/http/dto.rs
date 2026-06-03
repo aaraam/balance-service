@@ -1,5 +1,7 @@
 use crate::core::chains_meta::native_symbol_for;
+use crate::db::models::CryptoMarketTrackedTokenDoc;
 use crate::http::error::ApiErrorBody;
+use crate::market::techbank::TechbankMarketPriceItem;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +53,113 @@ pub struct TokenDecimalsResponse {
     pub contract_address: String,
     pub exists: bool,
     pub decimals: Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ApiErrorBody>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CryptoMarketPriceQuery {
+    pub currency: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CryptoMarketPriceResponse {
+    pub status: bool,
+    pub currency: String,
+    pub source_url: String,
+    pub saved_to_db: bool,
+    pub fetched_at: String,
+
+    #[serde(rename = "value")]
+    pub value: Vec<TechbankMarketPriceItem>,
+
+    #[serde(rename = "Count")]
+    pub count: usize,
+
+    pub source_count: usize,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracked_token_count: Option<usize>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coingecko_updated_count: Option<usize>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coingecko_error: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ApiErrorBody>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddCryptoMarketTokenRequest {
+    #[serde(alias = "id", alias = "coingecko_id")]
+    pub coingecko_id: String,
+
+    pub symbol: String,
+
+    pub currency: Option<String>,
+
+    #[serde(alias = "platformId", alias = "asset_platform_id")]
+    pub asset_platform_id: Option<String>,
+
+    #[serde(alias = "tokenAddress", alias = "contract_address")]
+    pub contract_address: Option<String>,
+
+    #[serde(default, alias = "token_addresses")]
+    pub token_addresses: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CryptoMarketTrackedTokenDto {
+    pub currency: String,
+    pub tracking_key: String,
+    pub coingecko_id: String,
+    pub symbol: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset_platform_id: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contract_address: Option<String>,
+
+    pub token_addresses: Vec<String>,
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl From<&CryptoMarketTrackedTokenDoc> for CryptoMarketTrackedTokenDto {
+    fn from(value: &CryptoMarketTrackedTokenDoc) -> Self {
+        Self {
+            currency: value.currency.clone(),
+            tracking_key: value.tracking_key.clone(),
+            coingecko_id: value.coingecko_id.clone(),
+            symbol: value.symbol.clone(),
+            asset_platform_id: value.asset_platform_id.clone(),
+            contract_address: value.contract_address.clone(),
+            token_addresses: value.token_addresses.clone(),
+            enabled: value.enabled,
+            created_at: value.created_at.to_string(),
+            updated_at: value.updated_at.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddCryptoMarketTokenResponse {
+    pub status: bool,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<CryptoMarketTrackedTokenDto>,
+
+    pub price_updated: bool,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ApiErrorBody>,

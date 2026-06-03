@@ -9,6 +9,7 @@ use tokio::time::Duration;
 use crate::chains::{is_ignored_network, supported_evm_networks};
 use crate::core::chains_meta::native_symbol_for;
 use crate::core::normalize::normalize_request;
+use crate::db::token_decimals_cache;
 use crate::evm::format::u256_to_decimal_string;
 use crate::evm::multicall3::{
     fetch_balances_multicall3, fetch_token_decimals_multicall3, EvmBalances,
@@ -514,19 +515,44 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             }
         };
 
-        let decimals_map = match fetch_token_decimals_multicall3(
-            &rpc,
+        let mut decimals_map = match token_decimals_cache::get_many(
+            &state.mongo.db,
+            net,
             &cg.contract_addresses,
-            MAX_CALLS_PER_BATCH,
         )
         .await
         {
-            Ok(m) => m,
+            Ok(cached) => cached,
             Err(e) => {
-                tracing::error!(network = %net, error = %e, "decimals fetch failed -> default 18");
+                tracing::warn!(
+                    network = %net,
+                    error = %e,
+                    "token decimals cache read failed; fetching all token decimals"
+                );
                 std::collections::HashMap::new()
             }
         };
+
+        let decimals_misses = cg
+            .contract_addresses
+            .iter()
+            .filter(|contract| !decimals_map.contains_key(*contract))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if !decimals_misses.is_empty() {
+            match fetch_token_decimals_multicall3(&rpc, &decimals_misses, MAX_CALLS_PER_BATCH).await
+            {
+                Ok(fetched) => {
+                    token_decimals_cache::upsert_many_existing(&state.mongo.db, net, &fetched)
+                        .await;
+                    decimals_map.extend(fetched);
+                }
+                Err(e) => {
+                    tracing::error!(network = %net, error = %e, "decimals fetch failed -> default 18");
+                }
+            }
+        }
 
         for w in &req.wallet_addresses {
             let row_idx = *evm_wallet_index
@@ -657,6 +683,12 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         let sol_rpc =
             SolanaRpcClient::new(state.cfg.solana_rpc_url.clone(), state.cfg.rpc_timeout_ms);
         let sol_mints = sol_mints_from_request(&req);
+        let valid_sol_mints = sol_mints
+            .iter()
+            .filter(|mint| is_valid_solana_pubkey_32(mint))
+            .cloned()
+            .collect::<Vec<_>>();
+        let sol_rpc_concurrency = state.cfg.solana_rpc_concurrency.max(1);
 
         let mut sol_total_lamports: u128 = 0;
         let mut spl_totals: std::collections::HashMap<String, u128> =
@@ -664,17 +696,36 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         let mut spl_decimals: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
 
-        for w in &req.solana_wallet_addresses {
-            let row_idx = *sol_wallet_index
-                .get(w)
-                .ok_or_else(|| anyhow!("sol wallet index missing"))?;
+        let sol_wallet_targets = req
+            .solana_wallet_addresses
+            .iter()
+            .map(|w| {
+                let row_idx = *sol_wallet_index
+                    .get(w)
+                    .ok_or_else(|| anyhow!("sol wallet index missing"))?;
+                Ok::<(usize, String), anyhow::Error>((row_idx, w.clone()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
-            let lamports = sol_rpc.get_balance_lamports(w).await.unwrap_or_else(|e| {
-                SOL_NET_FAIL.fetch_add(1, Ordering::Relaxed);
-                tracing::error!(wallet = %w, error = %e, "sol getBalance failed -> keeping zero");
-                0u64
-            });
+        let native_results: Vec<(usize, String, u64)> =
+            stream::iter(sol_wallet_targets.iter().cloned())
+                .map(|(row_idx, wallet)| {
+                    let sol_rpc = sol_rpc.clone();
+                    async move {
+                        let lamports =
+                            sol_rpc.get_balance_lamports(&wallet).await.unwrap_or_else(|e| {
+                                SOL_NET_FAIL.fetch_add(1, Ordering::Relaxed);
+                                tracing::error!(wallet = %wallet, error = %e, "sol getBalance failed -> keeping zero");
+                                0u64
+                            });
+                        (row_idx, wallet, lamports)
+                    }
+                })
+                .buffer_unordered(sol_rpc_concurrency)
+                .collect()
+                .await;
 
+        for (row_idx, _wallet, lamports) in native_results {
             sol_total_lamports = sol_total_lamports.saturating_add(lamports as u128);
 
             {
@@ -705,59 +756,74 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                     json!(lamports_u128_to_sol_fixed_18(lamports as u128)),
                 );
             }
+        }
 
-            for mint in &sol_mints {
-                if !is_valid_solana_pubkey_32(mint) {
-                    continue;
+        let spl_targets = sol_wallet_targets
+            .iter()
+            .flat_map(|(row_idx, wallet)| {
+                valid_sol_mints
+                    .iter()
+                    .map(move |mint| (*row_idx, wallet.clone(), mint.clone()))
+            })
+            .collect::<Vec<_>>();
+
+        let spl_results: Vec<(usize, String, String, u128, u32)> = stream::iter(spl_targets)
+            .map(|(row_idx, wallet, mint)| {
+                let sol_rpc = sol_rpc.clone();
+                async move {
+                    let (amount, decimals) = sol_rpc
+                        .get_spl_balance_by_owner_mint(&wallet, &mint)
+                        .await
+                        .unwrap_or_else(|e| {
+                            SOL_NET_FAIL.fetch_add(1, Ordering::Relaxed);
+                            tracing::error!(wallet = %wallet, mint = %mint, error = %e, "sol spl fetch failed");
+                            (0u128, 0u32)
+                        });
+                    (row_idx, wallet, mint, amount, decimals)
                 }
+            })
+            .buffer_unordered(sol_rpc_concurrency)
+            .collect()
+            .await;
 
-                let (amt_u128, dec_u32) = sol_rpc
-                    .get_spl_balance_by_owner_mint(w, mint)
-                    .await
-                    .unwrap_or_else(|e| {
-                        SOL_NET_FAIL.fetch_add(1, Ordering::Relaxed);
-                        tracing::error!(wallet = %w, mint = %mint, error = %e, "sol spl fetch failed");
-                        (0u128, 0u32)
-                    });
-
-                if dec_u32 > 0 {
-                    spl_decimals.entry(mint.clone()).or_insert(dec_u32);
-                }
-
-                *spl_totals.entry(mint.clone()).or_insert(0u128) += amt_u128;
-
-                let final_decimals = if dec_u32 > 0 {
-                    dec_u32
-                } else {
-                    *spl_decimals.get(mint).unwrap_or(&0)
-                };
-
-                let formatted = u128_base_units_to_fixed_18(amt_u128, final_decimals);
-
-                let data_arr = final_result
-                    .get_mut("data")
-                    .and_then(|v| v.as_array_mut())
-                    .ok_or_else(|| anyhow!("final_result.data missing or not array"))?;
-
-                let row = data_arr
-                    .get_mut(row_idx)
-                    .ok_or_else(|| anyhow!("wallet row missing"))?;
-
-                let bal_obj = row
-                    .get_mut("balance")
-                    .and_then(|v| v.as_object_mut())
-                    .ok_or_else(|| anyhow!("balance field not an object"))?;
-
-                if !bal_obj.contains_key("sol") {
-                    bal_obj.insert("sol".to_string(), json!({}));
-                }
-                let sol_obj = bal_obj
-                    .get_mut("sol")
-                    .and_then(|v| v.as_object_mut())
-                    .ok_or_else(|| anyhow!("balance.sol missing or not object"))?;
-
-                sol_obj.insert(mint.clone(), json!(formatted));
+        for (row_idx, _wallet, mint, amt_u128, dec_u32) in spl_results {
+            if dec_u32 > 0 {
+                spl_decimals.entry(mint.clone()).or_insert(dec_u32);
             }
+
+            *spl_totals.entry(mint.clone()).or_insert(0u128) += amt_u128;
+
+            let final_decimals = if dec_u32 > 0 {
+                dec_u32
+            } else {
+                *spl_decimals.get(&mint).unwrap_or(&0)
+            };
+
+            let formatted = u128_base_units_to_fixed_18(amt_u128, final_decimals);
+
+            let data_arr = final_result
+                .get_mut("data")
+                .and_then(|v| v.as_array_mut())
+                .ok_or_else(|| anyhow!("final_result.data missing or not array"))?;
+
+            let row = data_arr
+                .get_mut(row_idx)
+                .ok_or_else(|| anyhow!("wallet row missing"))?;
+
+            let bal_obj = row
+                .get_mut("balance")
+                .and_then(|v| v.as_object_mut())
+                .ok_or_else(|| anyhow!("balance field not an object"))?;
+
+            if !bal_obj.contains_key("sol") {
+                bal_obj.insert("sol".to_string(), json!({}));
+            }
+            let sol_obj = bal_obj
+                .get_mut("sol")
+                .and_then(|v| v.as_object_mut())
+                .ok_or_else(|| anyhow!("balance.sol missing or not object"))?;
+
+            sol_obj.insert(mint.clone(), json!(formatted));
         }
 
         {
@@ -885,17 +951,41 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                 HashMap::new()
             };
 
-            let decimals_map: HashMap<String, u32> = if do_trc20 && !b58_wallets.is_empty() {
-                fetch_trc20_decimals(
-                    &tron_rpc,
-                    &effective_contracts,
-                    &b58_wallets[0],
-                    MAX_TRON_CALLS_PER_BATCH,
-                )
-                .await
+            let mut decimals_map: HashMap<String, u32> = if do_trc20 {
+                match token_decimals_cache::get_many(&state.mongo.db, "trx", &effective_contracts)
+                    .await
+                {
+                    Ok(cached) => cached,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "TRON token decimals cache read failed; fetching all decimals"
+                        );
+                        HashMap::new()
+                    }
+                }
             } else {
                 HashMap::new()
             };
+
+            let decimals_misses = effective_contracts
+                .iter()
+                .filter(|contract| !decimals_map.contains_key(*contract))
+                .cloned()
+                .collect::<Vec<_>>();
+
+            if do_trc20 && !b58_wallets.is_empty() && !decimals_misses.is_empty() {
+                let fetched = fetch_trc20_decimals(
+                    &tron_rpc,
+                    &decimals_misses,
+                    &b58_wallets[0],
+                    MAX_TRON_CALLS_PER_BATCH,
+                )
+                .await;
+
+                token_decimals_cache::upsert_many_existing(&state.mongo.db, "trx", &fetched).await;
+                decimals_map.extend(fetched);
+            }
 
             (native_balances, trc20_balances, decimals_map)
         };
