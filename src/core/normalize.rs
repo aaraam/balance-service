@@ -1,26 +1,16 @@
-// ==================================================
-// balance-service\src\core\normalize.rs
-// ==================================================
-
-use crate::chains::{is_ignored_network, supported_evm_networks};
+use crate::chains::is_ignored_network;
 use crate::http::dto::{BalanceRequest, ContractGroup};
-
-fn lc(s: &str) -> String {
-    s.trim().to_lowercase()
-}
-
-// --- local validators (keep them here to avoid coupling normalize <-> validate) ---
 
 fn is_valid_evm_h160(s: &str) -> bool {
     let t = s.trim();
     if t.is_empty() {
         return false;
     }
-    let hex = t.strip_prefix("0x").unwrap_or(t);
-    if hex.len() != 40 {
+    let t = t.strip_prefix("0x").unwrap_or(t);
+    if t.len() != 40 {
         return false;
     }
-    hex.chars().all(|c| c.is_ascii_hexdigit())
+    t.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn is_valid_solana_pubkey_32(s: &str) -> bool {
@@ -30,14 +20,12 @@ fn is_valid_solana_pubkey_32(s: &str) -> bool {
     }
     let decoded = match bs58::decode(t).into_vec() {
         Ok(v) => v,
-        Err(_) => {
-            return false;
-        }
+        Err(_) => return false,
     };
     decoded.len() == 32
 }
 
-fn is_valid_tron_base58_addr(s: &str) -> bool {
+pub fn is_valid_tron_address(s: &str) -> bool {
     use sha2::{Digest, Sha256};
 
     let t = s.trim();
@@ -45,50 +33,67 @@ fn is_valid_tron_base58_addr(s: &str) -> bool {
         return false;
     }
 
-    // TRON base58check decode => 25 bytes (21 payload + 4 checksum)
     let decoded = match bs58::decode(t).into_vec() {
         Ok(v) => v,
-        Err(_) => {
-            return false;
-        }
+        Err(_) => return false,
     };
-
     if decoded.len() != 25 {
         return false;
     }
 
-    // payload = 21 bytes: [0x41][20 bytes addr]
     let (payload, checksum) = decoded.split_at(21);
-
-    if payload.first().copied() != Some(0x41) {
+    if payload[0] != 0x41 {
         return false;
     }
 
-    // checksum = first 4 bytes of sha256d(payload)
     let h1 = Sha256::digest(payload);
     let h2 = Sha256::digest(&h1);
     checksum == &h2[..4]
 }
 
+pub fn supported_evm_networks() -> std::collections::HashMap<&'static str, &'static str> {
+    let mut m = std::collections::HashMap::new();
+    m.insert("eth", "Ethereum");
+    m.insert("bnb", "BNB Chain");
+    m.insert("matic", "Polygon");
+    m.insert("op", "Optimism");
+    m.insert("gnosis", "Gnosis");
+    m.insert("rstk", "Rootstock");
+    m.insert("ethc", "Ethereum Classic");
+    m.insert("linea", "Linea");
+    m.insert("base", "Base");
+    m.insert("mantle", "Mantle");
+    m.insert("mint", "Mint");
+    m.insert("heco", "HECO");
+    m.insert("avax", "Avalanche");
+    m.insert("ftm", "Fantom");
+    m.insert("cro", "Cronos");
+    m.insert("arb1", "Arbitrum One");
+    m.insert("palm", "Palm");
+    m.insert("cypress", "Klaytn Cypress");
+    m.insert("iotex", "IoTeX");
+    m.insert("aurora", "Aurora");
+    m.insert("mcardano", "Milkomeda Cardano");
+    m.insert("okxchain", "OKX Chain");
+    m.insert("callisto", "Callisto");
+    m
+}
+
 pub fn normalize_request(req: &BalanceRequest) -> BalanceRequest {
     let evm_supported = supported_evm_networks();
 
-    // -----------------------
-    // Normalize + SANITIZE EVM wallets
-    // -----------------------
-    let mut evm_wallets: Vec<String> = req
+    // 1. walletAddresses is STRICTLY EVM-only now
+    let mut wallet_addresses: Vec<String> = req
         .wallet_addresses
         .iter()
-        .map(|w| lc(w))
+        .map(|w| w.trim().to_lowercase())
         .filter(|w| is_valid_evm_h160(w))
         .collect();
 
-    evm_wallets.sort();
-    evm_wallets.dedup();
+    wallet_addresses.sort();
+    wallet_addresses.dedup();
 
-    // -----------------------
-    // Normalize + SANITIZE Solana wallets (case-sensitive, trim only)
-    // -----------------------
+    // 2. Solana stays separate
     let mut sol_wallets: Vec<String> = req
         .solana_wallet_addresses
         .iter()
@@ -99,63 +104,69 @@ pub fn normalize_request(req: &BalanceRequest) -> BalanceRequest {
     sol_wallets.sort();
     sol_wallets.dedup();
 
-    // -----------------------
-    // Normalize + SANITIZE TRON wallets (base58check, trim only)
-    // -----------------------
-    let mut tron_wallets: Vec<String> = req
-        .tron_wallet_addresses
-        .iter()
-        .map(|w| w.trim().to_string())
-        .filter(|w| is_valid_tron_base58_addr(w))
-        .collect();
+    // 3. We no longer care about explicitly passed TRON wallets for this flow
+    // But we keep the field empty to satisfy the struct
+    let tron_wallets: Vec<String> = vec![];
 
-    tron_wallets.sort();
-    tron_wallets.dedup();
-
-    // -----------------------
-    // Normalize contracts per network, DROP ignored networks,
-    // and DROP unsupported networks + invalid addresses
-    // -----------------------
+    // 4. Contracts (Your existing logic here is already correct and preserves "trx")
     let mut contracts: Vec<ContractGroup> = req
         .contracts
         .iter()
         .filter_map(|c| {
-            let net = lc(&c.network_name);
+            let net = c.network_name.to_lowercase();
 
-            // ignore these networks entirely (compat)
             if is_ignored_network(net.as_str()) {
                 return None;
             }
 
-            // only allow: "sol" OR "trx" OR supported EVM networks
-            if net != "sol" && net != "trx" && !evm_supported.contains_key(net.as_str()) {
-                return None;
-            }
-
-            // normalize addresses
-            let mut addrs: Vec<String> = if net == "sol" {
-                // Solana mint addresses are base58 and case-sensitive => DO NOT lowercase
-                c.contract_addresses
+            if net == "sol" {
+                let mut addrs: Vec<String> = c
+                    .contract_addresses
                     .iter()
                     .map(|a| a.trim().to_string())
                     .filter(|a| is_valid_solana_pubkey_32(a))
-                    .collect()
-            } else if net == "trx" {
-                // TRON TRC20 contracts are base58check and case-sensitive-ish => DO NOT lowercase
-                c.contract_addresses
+                    .collect();
+                addrs.sort();
+                addrs.dedup();
+                return if addrs.is_empty() {
+                    None
+                } else {
+                    Some(ContractGroup {
+                        network_name: net,
+                        contract_addresses: addrs,
+                    })
+                };
+            }
+
+            if net == "trx" {
+                let mut addrs: Vec<String> = c
+                    .contract_addresses
                     .iter()
                     .map(|a| a.trim().to_string())
-                    .filter(|a| is_valid_tron_base58_addr(a))
-                    .collect()
-            } else {
-                // EVM contract addresses => lowercase ok
-                c.contract_addresses
-                    .iter()
-                    .map(|a| lc(a))
-                    .filter(|a| is_valid_evm_h160(a))
-                    .collect()
-            };
+                    .filter(|a| is_valid_tron_address(a))
+                    .collect();
+                addrs.sort();
+                addrs.dedup();
+                return if addrs.is_empty() {
+                    None
+                } else {
+                    Some(ContractGroup {
+                        network_name: net,
+                        contract_addresses: addrs,
+                    })
+                };
+            }
 
+            if !evm_supported.contains_key(net.as_str()) {
+                return None;
+            }
+
+            let mut addrs: Vec<String> = c
+                .contract_addresses
+                .iter()
+                .map(|a| a.trim().to_lowercase())
+                .filter(|a| is_valid_evm_h160(a))
+                .collect();
             addrs.sort();
             addrs.dedup();
 
@@ -171,10 +182,9 @@ pub fn normalize_request(req: &BalanceRequest) -> BalanceRequest {
     BalanceRequest {
         hard_refresh: req.hard_refresh,
         contracts,
-        wallet_addresses: evm_wallets,
+        wallet_addresses,
         solana_wallet_addresses: sol_wallets,
         tron_wallet_addresses: tron_wallets,
-        // keep for backward compat but always empty (as you already do)
         doge_wallet_addresses: vec![],
         btc_wallet_addresses: vec![],
     }

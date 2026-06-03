@@ -1,225 +1,295 @@
-// ==================================================
-// balance-service\src\http\handlers.rs
-// ==================================================
-
 use crate::core::key::request_key_from_canonical_json;
 use crate::core::normalize::normalize_request;
+use crate::core::token_decimals::{
+    fetch_token_decimals, normalize_token_decimals_target, TokenDecimalsValidationError,
+};
 use crate::db::{refresh_jobs, snapshots};
-use crate::http::dto::{zero_result_from_request, BalanceRequest, BalanceResponse};
-use crate::http::validate::{validate_normalized_request, validate_request_limits};
+use crate::http::dto::{
+    zero_result_from_request, BalanceRequest, BalanceResponse, TokenDecimalsRequest,
+    TokenDecimalsResponse,
+};
+use crate::http::error::ApiErrorBody;
+use crate::http::validate::validate_request_limits;
 use crate::AppState;
-
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
-use bson::DateTime;
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
 use serde_json::json;
 
-const STALE_AFTER_SECS: i64 = 30;
+pub async fn health() -> impl IntoResponse {
+    (StatusCode::OK, "ok")
+}
 
-/// Hard refresh cooldown (prevents hammering)
-const HARD_REFRESH_COOLDOWN_SECS: i64 = 10;
+fn token_decimals_error_response(
+    status: StatusCode,
+    blockchain: impl Into<String>,
+    contract_address: impl Into<String>,
+    code: impl Into<String>,
+    message: impl Into<String>,
+    details: Option<serde_json::Value>,
+) -> Response {
+    (
+        status,
+        Json(TokenDecimalsResponse {
+            status: false,
+            blockchain: blockchain.into(),
+            contract_address: contract_address.into(),
+            exists: false,
+            decimals: None,
+            error: Some(ApiErrorBody {
+                code: code.into(),
+                message: message.into(),
+                details,
+            }),
+        }),
+    )
+        .into_response()
+}
 
-pub async fn health() -> &'static str {
-    "ok"
+pub async fn get_token_decimals(
+    State(state): State<AppState>,
+    Json(req): Json<TokenDecimalsRequest>,
+) -> impl IntoResponse {
+    let target = match normalize_token_decimals_target(&req.blockchain, &req.contract_address) {
+        Ok(target) => target,
+        Err(e) => {
+            let (code, details) = match &e {
+                TokenDecimalsValidationError::UnsupportedBlockchain(blockchain) => (
+                    "INVALID_BLOCKCHAIN",
+                    Some(json!({ "blockchain": blockchain })),
+                ),
+                TokenDecimalsValidationError::InvalidContractAddress {
+                    blockchain,
+                    contract_address,
+                } => (
+                    "INVALID_CONTRACT",
+                    Some(json!({
+                        "blockchain": blockchain,
+                        "contractAddress": contract_address
+                    })),
+                ),
+            };
+
+            return token_decimals_error_response(
+                StatusCode::BAD_REQUEST,
+                req.blockchain,
+                req.contract_address,
+                code,
+                e.to_string(),
+                details,
+            );
+        }
+    };
+
+    match fetch_token_decimals(&state.cfg, &target).await {
+        Ok(decimals) => (
+            StatusCode::OK,
+            Json(TokenDecimalsResponse {
+                status: true,
+                blockchain: target.blockchain,
+                contract_address: target.contract_address,
+                exists: decimals.is_some(),
+                decimals,
+                error: None,
+            }),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(
+                blockchain = %target.blockchain,
+                contract = %target.contract_address,
+                error = %e,
+                "token decimals lookup failed"
+            );
+            token_decimals_error_response(
+                StatusCode::BAD_GATEWAY,
+                target.blockchain,
+                target.contract_address,
+                "TOKEN_DECIMALS_LOOKUP_FAILED",
+                e.to_string(),
+                None,
+            )
+        }
+    }
+}
+
+fn cache_key_request(req: &BalanceRequest) -> BalanceRequest {
+    let mut key_req = req.clone();
+    key_req.hard_refresh = false;
+    key_req
+}
+
+fn should_refresh_existing(hard_refresh: bool, existing_is_complete: bool) -> bool {
+    hard_refresh || !existing_is_complete
+}
+
+pub async fn get_job_status(
+    State(state): State<AppState>,
+    Path(request_key): Path<String>,
+) -> impl IntoResponse {
+    // Use lightweight projection to avoid fetching the massive result JSON
+    let snap = snapshots::get_snapshot_status(&state.mongo.db, &request_key).await;
+
+    match snap {
+        Ok(Some(s)) => (
+            StatusCode::OK,
+            Json(BalanceResponse {
+                status: true,
+                is_complete: s.is_complete,
+                has_changed: s.has_changed,
+                request_key,
+                result: serde_json::json!({}), // Return empty result to avoid heavy payloads
+                progress_stage: s.progress_stage,
+                error: None,
+            }),
+        )
+            .into_response(),
+
+        _ => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": false,
+                "message": "request_key not found"
+            })),
+        )
+            .into_response(),
+    }
 }
 
 pub async fn get_multi_wallet_balances(
     State(state): State<AppState>,
     Json(req): Json<BalanceRequest>,
 ) -> impl IntoResponse {
-    // 1) Validate raw limits first (cheap anti-abuse)
     if let Err(e) = validate_request_limits(&req) {
         return e.into_response();
     }
 
-    // 2) Normalize
     let normalized = normalize_request(&req);
 
-    // 3) Validate normalized request (addresses, networks, work units)
-    if let Err(e) = validate_normalized_request(&normalized) {
-        return e.into_response();
-    }
-
-    let canonical = serde_json::to_string(&normalized).unwrap_or_else(|_| "{}".to_string());
-    let request_key = request_key_from_canonical_json(&canonical);
-
-    tracing::info!(
-        request_key = %request_key,
-        hard_refresh = normalized.hard_refresh,
-        evm_wallets = normalized.wallet_addresses.len(),
-        sol_wallets = normalized.solana_wallet_addresses.len(),
-        tron_wallets = normalized.tron_wallet_addresses.len(),
-        doge_wallets = normalized.doge_wallet_addresses.len(),
-        btc_wallets = normalized.btc_wallet_addresses.len(),
-        contracts = ?normalized.contracts
-            .iter()
-            .map(|c| (&c.network_name, c.contract_addresses.len()))
-            .collect::<Vec<_>>(),
-        "balances request received"
-    );
-
-    let now = DateTime::now();
-
-    match snapshots::get_snapshot(&state.mongo.db, &request_key).await {
-        Ok(Some(doc)) => {
-            let age_secs = (now.timestamp_millis() - doc.last_updated_at.timestamp_millis()) / 1000;
-            let is_stale = age_secs > STALE_AFTER_SECS;
-
-            tracing::debug!(
-                request_key = %request_key,
-                age_secs = age_secs,
-                is_stale = is_stale,
-                refresh_state = %doc.refresh_state,
-                is_complete = doc.is_complete,
-                "snapshot hit"
-            );
-
-            // Hard refresh cooldown to prevent spam
-            let hard_refresh_allowed = if normalized.hard_refresh {
-                age_secs >= HARD_REFRESH_COOLDOWN_SECS
-            } else {
-                true
-            };
-
-            if (is_stale || normalized.hard_refresh) && hard_refresh_allowed {
-                match refresh_jobs::enqueue_or_requeue(&state.mongo.db, &request_key).await {
-                    Ok(did_queue) => {
-                        tracing::info!(
-                            request_key = %request_key,
-                            did_queue = did_queue,
-                            "refresh job enqueue_or_requeue result"
-                        );
-
-                        if did_queue {
-                            let _ = snapshots::set_refresh_state(
-                                &state.mongo.db,
-                                &request_key,
-                                "queued",
-                            )
-                            .await;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            request_key=%request_key,
-                            error=%e,
-                            "failed to enqueue refresh job"
-                        );
-                    }
-                }
-            } else if normalized.hard_refresh && !hard_refresh_allowed {
-                tracing::debug!(
-                    request_key = %request_key,
-                    age_secs = age_secs,
-                    cooldown_secs = HARD_REFRESH_COOLDOWN_SECS,
-                    "hard_refresh skipped due to cooldown"
-                );
-            }
-
-            Json(BalanceResponse {
-                status: true,
-                is_complete: doc.is_complete,
-                has_changed: doc.has_changed, // ✅ NEW: Return from DB
-                result: doc.result,
-                error: None,
-            })
-            .into_response()
+    let canonical_json = match serde_json::to_string(&cache_key_request(&normalized)) {
+        Ok(s) => s,
+        Err(e) => {
+            return crate::http::error::ApiError::bad_request("JSON_ERROR", &e.to_string(), None)
+                .into_response();
         }
+    };
 
-        Ok(None) => {
-            tracing::info!(
-                request_key=%request_key,
-                "snapshot miss → creating zero snapshot + enqueue job"
-            );
+    let request_key = request_key_from_canonical_json(&canonical_json);
+    let zero_result = zero_result_from_request(&normalized);
 
-            let normalized_json = serde_json::to_value(&normalized).unwrap_or(json!({}));
-            let zero_result = zero_result_from_request(&normalized);
+    let snap = snapshots::get_snapshot(&state.mongo.db, &request_key).await;
 
-            if let Err(e) = snapshots::upsert_empty_snapshot(
-                &state.mongo.db,
-                &request_key,
-                normalized_json,
-                zero_result.clone(),
-            )
-            .await
-            {
-                tracing::error!(
-                    request_key=%request_key,
-                    error=%e,
-                    "failed to upsert zero snapshot"
-                );
-            }
+    match snap {
+        Ok(Some(existing)) => {
+            let existing_is_complete = existing.is_complete;
+            let should_refresh =
+                should_refresh_existing(normalized.hard_refresh, existing_is_complete);
 
-            match refresh_jobs::enqueue_or_requeue(&state.mongo.db, &request_key).await {
-                Ok(did_queue) => {
-                    tracing::info!(
-                        request_key=%request_key,
-                        did_queue=did_queue,
-                        "refresh job enqueue_or_requeue result"
-                    );
-
+            if should_refresh {
+                if let Ok(did_queue) =
+                    refresh_jobs::enqueue_or_requeue(&state.mongo.db, &request_key).await
+                {
                     if did_queue {
                         let _ =
                             snapshots::set_refresh_state(&state.mongo.db, &request_key, "queued")
                                 .await;
+                        if let Err(e) = state.queue.publish(&request_key).await {
+                            tracing::error!(request_key=%request_key, error=%e, "failed to publish job to queue");
+                        }
                     }
                 }
-                Err(e) => tracing::error!(
-                    request_key=%request_key,
-                    error=%e,
-                    "failed to enqueue refresh job"
-                ),
             }
 
-            Json(BalanceResponse {
-                status: true,
-                is_complete: false,
-                has_changed: true, // ✅ NEW: Fresh creation is a "change"
-                result: zero_result,
-                error: None,
-            })
-            .into_response()
+            (
+                StatusCode::OK,
+                Json(BalanceResponse {
+                    status: true,
+                    is_complete: existing_is_complete,
+                    has_changed: existing.has_changed,
+                    result: existing.result, // Main fetch still returns the full payload
+                    request_key,
+                    progress_stage: existing.progress_stage,
+                    error: None,
+                }),
+            )
+                .into_response()
         }
 
-        Err(e) => {
-            tracing::error!(
-                request_key=%request_key,
-                error=%e,
-                "snapshot fetch error (fail-soft)"
-            );
+        _ => {
+            let normalized_value =
+                serde_json::to_value(&normalized).unwrap_or(serde_json::json!({}));
 
-            let zero_result = zero_result_from_request(&normalized);
+            let _ = snapshots::upsert_empty_snapshot(
+                &state.mongo.db,
+                &request_key,
+                normalized_value,
+                zero_result.clone(),
+            )
+            .await;
 
-            Json(BalanceResponse {
-                status: true,
-                is_complete: false,
-                has_changed: false, // ✅ NEW
-                result: zero_result,
-                error: None,
-            })
-            .into_response()
+            if let Ok(did_queue) =
+                refresh_jobs::enqueue_or_requeue(&state.mongo.db, &request_key).await
+            {
+                if did_queue {
+                    let _ =
+                        snapshots::set_refresh_state(&state.mongo.db, &request_key, "queued").await;
+                    if let Err(e) = state.queue.publish(&request_key).await {
+                        tracing::error!(request_key=%request_key, error=%e, "failed to publish job to queue");
+                    }
+                }
+            }
+
+            (
+                StatusCode::OK,
+                Json(BalanceResponse {
+                    status: true,
+                    is_complete: false,
+                    has_changed: false,
+                    result: zero_result,
+                    request_key,
+                    progress_stage: Some("queued".to_string()),
+                    error: None,
+                }),
+            )
+                .into_response()
         }
     }
 }
 
-/// OPTIONAL: If you ever want to return errors explicitly from inside this handler:
-#[allow(dead_code)]
-fn bad_request(
-    code: &str,
-    message: &str,
-    details: serde_json::Value,
-) -> (StatusCode, Json<BalanceResponse>) {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(BalanceResponse {
-            status: false,
-            is_complete: false,
-            has_changed: false, // ✅ NEW
-            result: json!({}),
-            error: Some(crate::http::error::ApiErrorBody {
-                code: code.to_string(),
-                message: message.to_string(),
-                details: Some(details),
-            }),
-        }),
-    )
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::dto::ContractGroup;
+
+    #[test]
+    fn cache_key_ignores_hard_refresh_flag() {
+        let mut req = BalanceRequest {
+            hard_refresh: true,
+            contracts: vec![ContractGroup {
+                network_name: "trx".to_string(),
+                contract_addresses: vec!["token".to_string()],
+            }],
+            wallet_addresses: vec!["wallet".to_string()],
+            solana_wallet_addresses: vec![],
+            tron_wallet_addresses: vec![],
+            doge_wallet_addresses: vec![],
+            btc_wallet_addresses: vec![],
+        };
+
+        let hard_refresh_key = serde_json::to_string(&cache_key_request(&req)).unwrap();
+        req.hard_refresh = false;
+        let normal_key = serde_json::to_string(&cache_key_request(&req)).unwrap();
+
+        assert_eq!(hard_refresh_key, normal_key);
+    }
+
+    #[test]
+    fn hard_refresh_requeues_complete_snapshots() {
+        assert!(should_refresh_existing(true, true));
+        assert!(should_refresh_existing(false, false));
+        assert!(!should_refresh_existing(false, true));
+    }
 }

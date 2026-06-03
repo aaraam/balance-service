@@ -119,4 +119,105 @@ impl SolanaRpcClient {
 
         Ok((amount_u128, decimals))
     }
+
+    pub async fn get_spl_mint_decimals(
+        &self,
+        mint_pubkey: &str,
+    ) -> Result<Option<u32>, anyhow::Error> {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [
+                mint_pubkey,
+                { "encoding": "jsonParsed" }
+            ]
+        });
+
+        let res = self.http.post(&self.rpc_url).json(&payload).send().await?;
+        let status = res.status();
+        let v: serde_json::Value = res.json().await?;
+
+        if !status.is_success() {
+            return Err(anyhow!(
+                "sol rpc http error (getAccountInfo): status={} body={}",
+                status,
+                v
+            ));
+        }
+        if let Some(err) = v.get("error") {
+            return Err(anyhow!("sol rpc error (getAccountInfo): {}", err));
+        }
+
+        Ok(parse_spl_mint_decimals_from_account_info(&v))
+    }
+}
+
+fn parse_spl_mint_decimals_from_account_info(v: &serde_json::Value) -> Option<u32> {
+    let value = v.get("result")?.get("value")?;
+    if value.is_null() {
+        return None;
+    }
+
+    let parsed = value.get("data")?.get("parsed")?;
+    if parsed.get("type").and_then(|x| x.as_str()) != Some("mint") {
+        return None;
+    }
+
+    let decimals = parsed.get("info")?.get("decimals")?.as_u64()?;
+
+    u32::try_from(decimals).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parses_spl_mint_decimals_from_account_info() {
+        let payload = json!({
+            "result": {
+                "value": {
+                    "data": {
+                        "parsed": {
+                            "type": "mint",
+                            "info": {
+                                "decimals": 6
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        assert_eq!(parse_spl_mint_decimals_from_account_info(&payload), Some(6));
+    }
+
+    #[test]
+    fn spl_mint_decimals_parser_returns_none_for_missing_or_non_mint_accounts() {
+        assert_eq!(
+            parse_spl_mint_decimals_from_account_info(&json!({ "result": { "value": null } })),
+            None
+        );
+
+        let token_account = json!({
+            "result": {
+                "value": {
+                    "data": {
+                        "parsed": {
+                            "type": "account",
+                            "info": {
+                                "tokenAmount": { "decimals": 6 }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            parse_spl_mint_decimals_from_account_info(&token_account),
+            None
+        );
+    }
 }

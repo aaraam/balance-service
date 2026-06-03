@@ -1,40 +1,54 @@
-// ==================================================
-// balance-service\src\worker\runner.rs
-// ==================================================
-
 use crate::AppState;
 use anyhow::anyhow;
-use bson::{ doc, DateTime };
-use futures::stream::{ self, StreamExt }; 
-use mongodb::options::{ FindOneAndUpdateOptions, ReturnDocument };
+use bson::{doc, DateTime};
+use futures::stream::{self, StreamExt};
+use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
 use serde_json::json;
+use tokio::time::Duration;
 
-use crate::chains::{ is_ignored_network, supported_evm_networks };
+use crate::chains::{is_ignored_network, supported_evm_networks};
+use crate::core::chains_meta::native_symbol_for;
 use crate::core::normalize::normalize_request;
 use crate::evm::format::u256_to_decimal_string;
 use crate::evm::multicall3::{
-    fetch_balances_multicall3,
-    fetch_token_decimals_multicall3,
-    EvmBalances,
+    fetch_balances_multicall3, fetch_token_decimals_multicall3, EvmBalances,
 };
 use crate::evm::rpc::RpcClient;
-use crate::http::dto::{ zero_result_from_request, BalanceRequest };
+use crate::http::dto::{trc20_contracts_from_request, zero_result_from_request, BalanceRequest};
 use crate::solana::rpc::SolanaRpcClient;
+use crate::tron::multicall3::{
+    fetch_all_tron_balances, fetch_native_trx_concurrent, fetch_trc20_decimals,
+    MAX_TRON_CALLS_PER_BATCH, TRON_NATIVE_CONCURRENCY,
+};
 use crate::tron::rpc::TronRpcClient;
 
-use std::sync::atomic::{ AtomicU64, Ordering };
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 const MAX_CALLS_PER_BATCH: usize = 600;
-
-/// Limits concurrent HTTP requests to Tron to avoid hitting API rate limits.
-const TRON_CONCURRENCY_LIMIT: usize = 5;
-
 const NATIVE_DECIMALS: u32 = 18;
 const SOL_DECIMALS: u32 = 9;
-const TRX_DECIMALS: u32 = 6;
 
-// --- ultra-light metrics (process-local) ---
+// TRON phase guards — prevent large requests from turning into latency grenades.
+const TRON_MAX_WALLETS_PER_JOB: usize = 100;
+const TRON_MAX_TOKENS_PER_JOB: usize = 20;
+const TRON_MAX_PAIR_CALLS_PER_JOB: usize = 1000;
+
+/// Hard wall-clock budget for the entire TRON phase.
+/// If TRON exceeds this,
+/// EVM/SOL results are already persisted and the job completes without TRON.
+// Must be larger than (TRON_CALL_TIMEOUT_MS/1000 * worst-case sequential depth).
+// Native calls run concurrently, but TRC20 pair chunks run sequentially.
+// Budget = (chunks * per_call_timeout) + headroom.
+// 20s is safe for typical request sizes.
+const TRON_TOTAL_PHASE_TIMEOUT_SECS: u64 = 25;
+
+// Per-call HTTP timeout for TRON calls — deliberately shorter than EVM rpc_timeout_ms.
+// Keeps a single slow call from eating the entire phase budget.
+const TRON_CALL_TIMEOUT_MS: u64 = 5_000;
+
+// --- metrics ---
 static JOBS_CLAIMED: AtomicU64 = AtomicU64::new(0);
 static JOBS_DONE: AtomicU64 = AtomicU64::new(0);
 static JOBS_FAILED: AtomicU64 = AtomicU64::new(0);
@@ -45,8 +59,8 @@ static EVM_NET_FAIL: AtomicU64 = AtomicU64::new(0);
 static SOL_NET_OK: AtomicU64 = AtomicU64::new(0);
 static SOL_NET_FAIL: AtomicU64 = AtomicU64::new(0);
 
-static TRX_NET_OK: AtomicU64 = AtomicU64::new(0);
-static TRX_NET_FAIL: AtomicU64 = AtomicU64::new(0);
+static TRON_NET_OK: AtomicU64 = AtomicU64::new(0);
+static TRON_NET_FAIL: AtomicU64 = AtomicU64::new(0);
 
 fn is_valid_solana_pubkey_32(s: &str) -> bool {
     let t = s.trim();
@@ -55,21 +69,9 @@ fn is_valid_solana_pubkey_32(s: &str) -> bool {
     }
     let decoded = match bs58::decode(t).into_vec() {
         Ok(v) => v,
-        Err(_) => {
-            return false;
-        }
+        Err(_) => return false,
     };
     decoded.len() == 32
-}
-
-fn native_symbol_for(network: &str) -> &str {
-    match network {
-        "eth" => "eth",
-        "bnb" => "bnb",
-        "matic" => "matic",
-        "op" => "op",
-        _ => network, 
-    }
 }
 
 fn u128_base_units_to_fixed_18(value: u128, decimals: u32) -> String {
@@ -78,9 +80,7 @@ fn u128_base_units_to_fixed_18(value: u128, decimals: u32) -> String {
     }
 
     let out_decimals: u32 = 18;
-
     let pow = (10u128).checked_pow(decimals.min(38)).unwrap_or(u128::MAX);
-
     if pow == u128::MAX && decimals > 38 {
         return format!("0.{}", "0".repeat(18));
     }
@@ -90,6 +90,7 @@ fn u128_base_units_to_fixed_18(value: u128, decimals: u32) -> String {
 
     let mut frac_str = frac.to_string();
     let dec_usize = decimals as usize;
+
     if frac_str.len() < dec_usize {
         frac_str = format!("{}{}", "0".repeat(dec_usize - frac_str.len()), frac_str);
     }
@@ -103,12 +104,34 @@ fn u128_base_units_to_fixed_18(value: u128, decimals: u32) -> String {
     format!("{}.{}", whole, frac_str)
 }
 
+fn u256_base_units_to_fixed_18(value: ethereum_types::U256, decimals: u32) -> String {
+    if decimals == 0 {
+        return format!(
+            "{}.{}",
+            u256_to_decimal_string(value, 0, false),
+            "0".repeat(18)
+        );
+    }
+
+    let decimal = u256_to_decimal_string(value, decimals, false);
+    let (whole, fraction) = decimal.split_once('.').unwrap_or((&decimal, ""));
+    let mut fraction = fraction.to_string();
+
+    if fraction.len() < 18 {
+        fraction.push_str(&"0".repeat(18 - fraction.len()));
+    } else if fraction.len() > 18 {
+        fraction.truncate(18);
+    }
+
+    format!("{}.{}", whole, fraction)
+}
+
 fn lamports_u128_to_sol_fixed_18(lamports: u128) -> String {
     u128_base_units_to_fixed_18(lamports, SOL_DECIMALS)
 }
 
-fn sun_u128_to_trx_fixed_18(sun: u128) -> String {
-    u128_base_units_to_fixed_18(sun, TRX_DECIMALS)
+fn sun_to_trx_fixed_18(sun: u64) -> String {
+    u128_base_units_to_fixed_18(sun as u128, 6)
 }
 
 fn sol_mints_from_request(req: &BalanceRequest) -> Vec<String> {
@@ -119,18 +142,179 @@ fn sol_mints_from_request(req: &BalanceRequest) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn tron_contracts_from_request(req: &BalanceRequest) -> Vec<String> {
-    req.contracts
-        .iter()
-        .find(|c| c.network_name == "trx")
-        .map(|c| c.contract_addresses.clone())
-        .unwrap_or_default()
+/// Persist the current in-memory `final_result` into the snapshot document.
+/// Called after each chain-family phase so the API can return partial data
+/// without waiting for the full job to complete.
+async fn persist_partial_result(
+    snapshots: &mongodb::Collection<bson::Document>,
+    request_key: &str,
+    final_result: &serde_json::Value,
+    req_sanitized_json: &serde_json::Value,
+    stage: &str,
+) -> Result<(), anyhow::Error> {
+    snapshots
+        .update_one(
+            doc! { "requestKey": request_key },
+            doc! {
+                "$set": {
+                    "lastUpdatedAt": DateTime::now(),
+                    "refreshState": "running",
+                    "isComplete": false,
+                    "progressStage": stage,
+                    "result": bson::to_bson(final_result).unwrap_or(bson::Bson::Null),
+                    "normalizedRequest": bson::to_bson(req_sanitized_json).unwrap_or(bson::Bson::Null),
+                }
+            },
+        )
+        .await?;
+    Ok(())
 }
 
 pub async fn run_worker(state: AppState) {
+    let worker_pool = state.cfg.worker_concurrency.max(1) as usize;
+
+    tracing::info!(
+        worker_enabled = state.cfg.worker_enabled,
+        worker_pool = worker_pool,
+        "worker started"
+    );
+
+    if state.cfg.nats_url.trim().is_empty() {
+        tracing::warn!("NATS_URL is empty; falling back to Mongo scan loop");
+        run_worker_mongo_fallback(state).await;
+        return;
+    }
+
+    let queue = state.queue.clone();
+    if let Err(e) = queue.ensure_stream().await {
+        tracing::error!(error = %e, "failed to ensure JetStream stream; falling back to Mongo scan loop");
+        run_worker_mongo_fallback(state).await;
+        return;
+    }
+
+    let consumer = match queue.get_or_create_consumer().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to get/create JetStream consumer; falling back to Mongo scan loop");
+            run_worker_mongo_fallback(state).await;
+            return;
+        }
+    };
+
+    loop {
+        if !state.cfg.worker_enabled {
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            continue;
+        }
+
+        let poll_ms = state.cfg.worker_poll_ms.max(50);
+
+        let mut batch_stream = match consumer.fetch().max_messages(32).messages().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "JetStream fetch failed; sleeping 1000ms");
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                continue;
+            }
+        };
+
+        let mut fetched = Vec::new();
+        while let Some(msg_result) = batch_stream.next().await {
+            if let Ok(msg) = msg_result {
+                fetched.push(msg);
+            }
+        }
+
+        if fetched.is_empty() {
+            tokio::time::sleep(Duration::from_millis(poll_ms)).await;
+            continue;
+        }
+
+        let state_ref = &state;
+
+        stream::iter(fetched)
+            .for_each_concurrent(worker_pool, |msg| async move {
+                let request_key = match std::str::from_utf8(msg.payload.as_ref()) {
+                    Ok(k) => k.trim().to_string(),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "dropping message: cannot decode requestKey");
+                        let _ = msg.ack().await;
+                        return;
+                    }
+                };
+
+                async fn claim_job_by_key(state: &AppState, request_key: &str) -> Result<bool, mongodb::error::Error> {
+                    let coll = state.mongo.db.collection::<bson::Document>("balance_refresh_jobs");
+                    let now = DateTime::now();
+                    let filter = doc! {
+                        "requestKey": request_key,
+                        "status": "queued",
+                        "$or": [
+                            { "nextRetryAt": bson::Bson::Null },
+                            { "nextRetryAt": { "$lte": now } }
+                        ]
+                    };
+
+                    let update = doc! { "$set": { "status": "running", "updatedAt": now } };
+                    let opts = FindOneAndUpdateOptions::builder().return_document(ReturnDocument::After).build();
+
+                    let doc_opt = coll.find_one_and_update(filter, update).with_options(opts).await?;
+                    Ok(doc_opt.is_some())
+                }
+
+                match claim_job_by_key(state_ref, &request_key).await {
+                    Ok(true) => {
+                        JOBS_CLAIMED.fetch_add(1, Ordering::Relaxed);
+                        tracing::info!(request_key = %request_key, "claimed job");
+
+                        let job_start = Instant::now();
+                        let res = process_job(state_ref, &request_key).await;
+
+                        match res {
+                            Ok(_) => {
+                                JOBS_DONE.fetch_add(1, Ordering::Relaxed);
+                                tracing::info!(
+                                    request_key = %request_key,
+                                    elapsed_ms = job_start.elapsed().as_millis(),
+                                    "job done"
+                                );
+                                let _ = msg.ack().await;
+                            }
+                            Err(e) => {
+                                JOBS_FAILED.fetch_add(1, Ordering::Relaxed);
+                                tracing::error!(
+                                    request_key = %request_key,
+                                    elapsed_ms = job_start.elapsed().as_millis(),
+                                    error = %e,
+                                    "job failed"
+                                );
+
+                                let _ = mark_job_failed(state_ref, &request_key).await;
+                                let _ = msg.ack_with(async_nats::jetstream::AckKind::Nak(None)).await;
+                            }
+                        }
+                    }
+                    Ok(false) => {
+                        let _ = msg.ack().await;
+                    }
+                    Err(e) => {
+                        tracing::error!(request_key=%request_key, error=%e, "failed to claim job in Mongo");
+                        let _ = msg.ack_with(async_nats::jetstream::AckKind::Nak(None)).await;
+                    }
+                }
+            })
+            .await;
+    }
+}
+
+async fn run_worker_mongo_fallback(state: AppState) {
     let poll_ms = state.cfg.worker_poll_ms;
 
-    tracing::info!(worker_enabled = state.cfg.worker_enabled, poll_ms = poll_ms, "worker started");
+    tracing::info!(
+        worker_enabled = state.cfg.worker_enabled,
+        poll_ms = poll_ms,
+        "worker mongo fallback started"
+    );
 
     loop {
         if !state.cfg.worker_enabled {
@@ -141,11 +325,7 @@ pub async fn run_worker(state: AppState) {
         match claim_next_job(&state).await {
             Ok(Some(request_key)) => {
                 JOBS_CLAIMED.fetch_add(1, Ordering::Relaxed);
-                tracing::info!(
-                    request_key = %request_key,
-                    jobs_claimed = JOBS_CLAIMED.load(Ordering::Relaxed),
-                    "claimed job"
-                );
+                tracing::info!(request_key = %request_key, "claimed job (mongo)");
 
                 let job_start = Instant::now();
                 let res = process_job(&state, &request_key).await;
@@ -156,9 +336,7 @@ pub async fn run_worker(state: AppState) {
                         tracing::info!(
                             request_key = %request_key,
                             elapsed_ms = job_start.elapsed().as_millis(),
-                            jobs_done = JOBS_DONE.load(Ordering::Relaxed),
-                            jobs_failed = JOBS_FAILED.load(Ordering::Relaxed),
-                            "job done"
+                            "job done (mongo)"
                         );
                     }
                     Err(e) => {
@@ -167,9 +345,7 @@ pub async fn run_worker(state: AppState) {
                             request_key = %request_key,
                             elapsed_ms = job_start.elapsed().as_millis(),
                             error = %e,
-                            jobs_done = JOBS_DONE.load(Ordering::Relaxed),
-                            jobs_failed = JOBS_FAILED.load(Ordering::Relaxed),
-                            "job failed"
+                            "job failed (mongo)"
                         );
                         let _ = mark_job_failed(&state, &request_key).await;
                     }
@@ -187,11 +363,13 @@ pub async fn run_worker(state: AppState) {
 }
 
 async fn claim_next_job(state: &AppState) -> Result<Option<String>, mongodb::error::Error> {
-    let coll = state.mongo.db.collection::<bson::Document>("balance_refresh_jobs");
+    let coll = state
+        .mongo
+        .db
+        .collection::<bson::Document>("balance_refresh_jobs");
     let now = DateTime::now();
 
-    let filter =
-        doc! {
+    let filter = doc! {
         "status": "queued",
         "$or": [
             { "nextRetryAt": bson::Bson::Null },
@@ -208,48 +386,47 @@ async fn claim_next_job(state: &AppState) -> Result<Option<String>, mongodb::err
         .return_document(ReturnDocument::After)
         .build();
 
-    let doc_opt = coll.find_one_and_update(filter, update).with_options(opts).await?;
-
-    Ok(
-        doc_opt.and_then(|d|
-            d
-                .get_str("requestKey")
-                .ok()
-                .map(|s| s.to_string())
-        )
-    )
+    let doc_opt = coll
+        .find_one_and_update(filter, update)
+        .with_options(opts)
+        .await?;
+    Ok(doc_opt.and_then(|d| d.get_str("requestKey").ok().map(|s| s.to_string())))
 }
 
 async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::Error> {
-    let snapshots = state.mongo.db.collection::<bson::Document>("balance_snapshots");
+    let snapshots = state
+        .mongo
+        .db
+        .collection::<bson::Document>("balance_snapshots");
     let now = DateTime::now();
 
-    // Mark snapshot running
-    snapshots.update_one(
-        doc! { "requestKey": request_key },
-        doc! { "$set": { "refreshState": "running", "isComplete": false } }
-    ).await?;
+    snapshots
+        .update_one(
+            doc! { "requestKey": request_key },
+            doc! { "$set": { "refreshState": "running", "isComplete": false } },
+        )
+        .await?;
 
-    // Load snapshot doc
     let snap = snapshots
-        .find_one(doc! { "requestKey": request_key }).await?
+        .find_one(doc! { "requestKey": request_key })
+        .await?
         .ok_or_else(|| anyhow!("snapshot not found for requestKey"))?;
 
-    // ✅ CAPTURE INITIAL STATE FOR CHANGE DETECTION
     let initial_result_json: serde_json::Value = snap
         .get("result")
         .cloned()
         .and_then(|b| bson::from_bson(b).ok())
         .unwrap_or(json!({}));
 
-    let normalized_req_bson = snap.get("normalizedRequest").cloned().unwrap_or(bson::Bson::Null);
+    let normalized_req_bson = snap
+        .get("normalizedRequest")
+        .cloned()
+        .unwrap_or(bson::Bson::Null);
 
-    let normalized_req_json: serde_json::Value = bson
-        ::from_bson(normalized_req_bson)
-        .unwrap_or_else(|_| json!({}));
+    let normalized_req_json: serde_json::Value =
+        bson::from_bson(normalized_req_bson).unwrap_or_else(|_| json!({}));
 
-    let req_raw: BalanceRequest = serde_json
-        ::from_value(normalized_req_json.clone())
+    let req_raw: BalanceRequest = serde_json::from_value(normalized_req_json.clone())
         .unwrap_or_else(|_| BalanceRequest {
             hard_refresh: false,
             contracts: vec![],
@@ -260,16 +437,10 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             btc_wallet_addresses: vec![],
         });
 
-    // Re-normalize inside worker
     let req: BalanceRequest = normalize_request(&req_raw);
-
-    // Heal snapshot.normalizedRequest
     let req_sanitized_json = serde_json::to_value(&req).unwrap_or_else(|_| json!({}));
-
-    // 1. Start with a fresh ZERO result shape (Contract Truth)
     let mut final_result = zero_result_from_request(&req);
 
-    // Overlay existing DB result if present to prevent flashing zeroes.
     if let Some(existing_bson) = snap.get("result") {
         if existing_bson != &bson::Bson::Null {
             if let Ok(existing_json) = bson::from_bson::<serde_json::Value>(existing_bson.clone()) {
@@ -278,25 +449,19 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         }
     }
 
-    // Row indices
-    let evm_wallet_index: std::collections::HashMap<String, usize> = req.wallet_addresses
+    let evm_wallet_index: std::collections::HashMap<String, usize> = req
+        .wallet_addresses
         .iter()
         .enumerate()
         .map(|(i, w)| (w.clone(), i))
         .collect();
 
     let sol_offset = req.wallet_addresses.len();
-    let sol_wallet_index: std::collections::HashMap<String, usize> = req.solana_wallet_addresses
+    let sol_wallet_index: std::collections::HashMap<String, usize> = req
+        .solana_wallet_addresses
         .iter()
         .enumerate()
         .map(|(i, w)| (w.clone(), sol_offset + i))
-        .collect();
-
-    let tron_offset = sol_offset + req.solana_wallet_addresses.len();
-    let tron_wallet_index: std::collections::HashMap<String, usize> = req.tron_wallet_addresses
-        .iter()
-        .enumerate()
-        .map(|(i, w)| (w.clone(), tron_offset + i))
         .collect();
 
     // ==========================
@@ -326,13 +491,13 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         let rpc_url = chain.thirdweb_rpc_url(&state.cfg.thirdweb_client_id);
         let rpc = RpcClient::new(rpc_url, state.cfg.rpc_timeout_ms);
 
-        let balances: EvmBalances = match
-            fetch_balances_multicall3(
-                &rpc,
-                &req.wallet_addresses,
-                &cg.contract_addresses,
-                MAX_CALLS_PER_BATCH
-            ).await
+        let balances: EvmBalances = match fetch_balances_multicall3(
+            &rpc,
+            &req.wallet_addresses,
+            &cg.contract_addresses,
+            MAX_CALLS_PER_BATCH,
+        )
+        .await
         {
             Ok(b) => b,
             Err(e) => {
@@ -349,8 +514,12 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             }
         };
 
-        let decimals_map = match
-            fetch_token_decimals_multicall3(&rpc, &cg.contract_addresses, MAX_CALLS_PER_BATCH).await
+        let decimals_map = match fetch_token_decimals_multicall3(
+            &rpc,
+            &cg.contract_addresses,
+            MAX_CALLS_PER_BATCH,
+        )
+        .await
         {
             Ok(m) => m,
             Err(e) => {
@@ -369,7 +538,9 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                 .and_then(|v| v.as_array_mut())
                 .ok_or_else(|| anyhow!("final_result.data missing or not array"))?;
 
-            let row = data_arr.get_mut(row_idx).ok_or_else(|| anyhow!("wallet row missing"))?;
+            let row = data_arr
+                .get_mut(row_idx)
+                .ok_or_else(|| anyhow!("wallet row missing"))?;
 
             let bal_obj = row
                 .get_mut("balance")
@@ -389,7 +560,8 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             chain_obj.insert(native_symbol_for(net).to_string(), json!(native_str));
 
             for token_addr in &cg.contract_addresses {
-                let raw_bal = balances.erc20
+                let raw_bal = balances
+                    .erc20
                     .get(w)
                     .and_then(|m| m.get(token_addr))
                     .cloned()
@@ -402,8 +574,8 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             }
         }
 
-        // totals
         let mut native_sum = ethereum_types::U256::zero();
+
         for w in &req.wallet_addresses {
             native_sum += balances.native.get(w).cloned().unwrap_or_default();
         }
@@ -426,14 +598,15 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
 
         total_chain_obj.insert(
             native_symbol_for(net).to_string(),
-            json!(u256_to_decimal_string(native_sum, NATIVE_DECIMALS, false))
+            json!(u256_to_decimal_string(native_sum, NATIVE_DECIMALS, false)),
         );
 
         for token_addr in &cg.contract_addresses {
             let mut sum = ethereum_types::U256::zero();
 
             for w in &req.wallet_addresses {
-                let v = balances.erc20
+                let v = balances
+                    .erc20
                     .get(w)
                     .and_then(|m| m.get(token_addr))
                     .cloned()
@@ -444,11 +617,12 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             let dec = decimals_map.get(token_addr).cloned().unwrap_or(18);
             total_chain_obj.insert(
                 token_addr.clone(),
-                json!(u256_to_decimal_string(sum, dec, false))
+                json!(u256_to_decimal_string(sum, dec, false)),
             );
         }
 
         EVM_NET_OK.fetch_add(1, Ordering::Relaxed);
+
         tracing::debug!(
             network = %net,
             elapsed_ms = net_start.elapsed().as_millis(),
@@ -462,41 +636,33 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
         }
     }
 
-    snapshots.update_one(
-        doc! { "requestKey": request_key },
-        doc! {
-                "$set": {
-                    "lastUpdatedAt": DateTime::now(),
-                    "refreshState": "running",
-                    "isComplete": false,
-                    "result": bson::to_bson(&final_result).unwrap_or(bson::Bson::Null),
-                    "normalizedRequest": bson::to_bson(&req_sanitized_json).unwrap_or(bson::Bson::Null)
-                }
-            }
-    ).await?;
-    tracing::debug!(request_key = %request_key, "incremental DB update (EVM done)");
+    // Persist EVM results immediately — SOL and TRON do not block clients from
+    // seeing EVM balances anymore.
+    persist_partial_result(
+        &snapshots,
+        request_key,
+        &final_result,
+        &req_sanitized_json,
+        "evm_done",
+    )
+    .await
+    .unwrap_or_else(|e| tracing::warn!(error = %e, "partial persist after EVM failed (non-fatal)"));
 
     // ==========================
     // SOL processing
     // ==========================
     if !req.solana_wallet_addresses.is_empty() {
         let sol_start = Instant::now();
-        let sol_rpc = SolanaRpcClient::new(
-            state.cfg.solana_rpc_url.clone(),
-            state.cfg.rpc_timeout_ms
-        );
 
+        let sol_rpc =
+            SolanaRpcClient::new(state.cfg.solana_rpc_url.clone(), state.cfg.rpc_timeout_ms);
         let sol_mints = sol_mints_from_request(&req);
 
         let mut sol_total_lamports: u128 = 0;
-        let mut spl_totals: std::collections::HashMap<
-            String,
-            u128
-        > = std::collections::HashMap::new();
-        let mut spl_decimals: std::collections::HashMap<
-            String,
-            u32
-        > = std::collections::HashMap::new();
+        let mut spl_totals: std::collections::HashMap<String, u128> =
+            std::collections::HashMap::new();
+        let mut spl_decimals: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
 
         for w in &req.solana_wallet_addresses {
             let row_idx = *sol_wallet_index
@@ -517,7 +683,9 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                     .and_then(|v| v.as_array_mut())
                     .ok_or_else(|| anyhow!("final_result.data missing or not array"))?;
 
-                let row = data_arr.get_mut(row_idx).ok_or_else(|| anyhow!("wallet row missing"))?;
+                let row = data_arr
+                    .get_mut(row_idx)
+                    .ok_or_else(|| anyhow!("wallet row missing"))?;
 
                 let bal_obj = row
                     .get_mut("balance")
@@ -534,26 +702,21 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
 
                 sol_obj.insert(
                     "sol".to_string(),
-                    json!(lamports_u128_to_sol_fixed_18(lamports as u128))
+                    json!(lamports_u128_to_sol_fixed_18(lamports as u128)),
                 );
             }
 
             for mint in &sol_mints {
                 if !is_valid_solana_pubkey_32(mint) {
-                    tracing::warn!(mint = %mint, "invalid sol mint in snapshot -> skipped");
                     continue;
                 }
 
                 let (amt_u128, dec_u32) = sol_rpc
-                    .get_spl_balance_by_owner_mint(w, mint).await
+                    .get_spl_balance_by_owner_mint(w, mint)
+                    .await
                     .unwrap_or_else(|e| {
                         SOL_NET_FAIL.fetch_add(1, Ordering::Relaxed);
-                        tracing::error!(
-                            wallet = %w,
-                            mint = %mint,
-                            error = %e,
-                            "sol spl fetch failed -> keeping zero"
-                        );
+                        tracing::error!(wallet = %w, mint = %mint, error = %e, "sol spl fetch failed");
                         (0u128, 0u32)
                     });
 
@@ -575,7 +738,11 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
                     .get_mut("data")
                     .and_then(|v| v.as_array_mut())
                     .ok_or_else(|| anyhow!("final_result.data missing or not array"))?;
-                let row = data_arr.get_mut(row_idx).ok_or_else(|| anyhow!("wallet row missing"))?;
+
+                let row = data_arr
+                    .get_mut(row_idx)
+                    .ok_or_else(|| anyhow!("wallet row missing"))?;
+
                 let bal_obj = row
                     .get_mut("balance")
                     .and_then(|v| v.as_object_mut())
@@ -604,28 +771,26 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             if !totals_balance_obj.contains_key("sol") {
                 totals_balance_obj.insert("sol".to_string(), json!({}));
             }
-            if
-                let Some(sol_total_obj) = totals_balance_obj
-                    .get_mut("sol")
-                    .and_then(|v| v.as_object_mut())
+            if let Some(sol_total_obj) = totals_balance_obj
+                .get_mut("sol")
+                .and_then(|v| v.as_object_mut())
             {
                 sol_total_obj.insert(
                     "sol".to_string(),
-                    json!(lamports_u128_to_sol_fixed_18(sol_total_lamports))
+                    json!(lamports_u128_to_sol_fixed_18(sol_total_lamports)),
                 );
 
                 for mint in &sol_mints {
                     let sum = spl_totals.get(mint).cloned().unwrap_or(0u128);
                     let dec = spl_decimals.get(mint).cloned().unwrap_or(0u32);
-                    sol_total_obj.insert(
-                        mint.clone(),
-                        json!(u128_base_units_to_fixed_18(sum, dec))
-                    );
+                    sol_total_obj
+                        .insert(mint.clone(), json!(u128_base_units_to_fixed_18(sum, dec)));
                 }
             }
         }
 
         SOL_NET_OK.fetch_add(1, Ordering::Relaxed);
+
         tracing::debug!(
             elapsed_ms = sol_start.elapsed().as_millis(),
             sol_ok = SOL_NET_OK.load(Ordering::Relaxed),
@@ -634,287 +799,244 @@ async fn process_job(state: &AppState, request_key: &str) -> Result<(), anyhow::
             wallets = req.solana_wallet_addresses.len(),
             "sol network processed"
         );
-
-        // ✅ INCREMENTAL UPDATE #2: SOLANA DONE
-        snapshots.update_one(
-            doc! { "requestKey": request_key },
-            doc! {
-                    "$set": {
-                        "lastUpdatedAt": DateTime::now(),
-                        "refreshState": "running",
-                        "isComplete": false,
-                        "result": bson::to_bson(&final_result).unwrap_or(bson::Bson::Null),
-                        "normalizedRequest": bson::to_bson(&req_sanitized_json).unwrap_or(bson::Bson::Null)
-                    }
-                }
-        ).await?;
-        tracing::debug!(request_key = %request_key, "incremental DB update (Solana done)");
     }
 
-    // ==========================
-    // TRON processing
-    // ==========================
-    let tron_contracts = tron_contracts_from_request(&req);
-    let tron_requested = !req.tron_wallet_addresses.is_empty() || !tron_contracts.is_empty();
+    // Persist EVM + SOL so the client sees these immediately, before TRON runs.
+    persist_partial_result(
+        &snapshots,
+        request_key,
+        &final_result,
+        &req_sanitized_json,
+        "sol_done",
+    )
+    .await
+    .unwrap_or_else(|e| tracing::warn!(error = %e, "partial persist after SOL failed (non-fatal)"));
 
-    if
-        tron_requested &&
-        (!req.tron_wallet_addresses.is_empty() || !req.wallet_addresses.is_empty())
-    {
-        let trx_start = Instant::now();
+    // ==========================
+    // TRON processing (Derived from EVM)
+    // ==========================
+    let trc20_contracts = trc20_contracts_from_request(&req);
+    let has_trx =
+        !trc20_contracts.is_empty() || req.contracts.iter().any(|c| c.network_name == "trx");
 
-        let tron = TronRpcClient::new(
+    if has_trx && !req.wallet_addresses.is_empty() {
+        let tron_rpc = TronRpcClient::new(
             state.cfg.tron_fullnode_url.clone(),
             state.cfg.tron_solidity_url.clone(),
             state.cfg.tron_api_key.clone(),
-            state.cfg.rpc_timeout_ms
+            TRON_CALL_TIMEOUT_MS, // intentionally shorter than EVM rpc_timeout_ms
         );
 
-        let mut dec_cache: std::collections::HashMap<
-            String,
-            u32
-        > = std::collections::HashMap::new();
+        // Build (row_idx, b58_wallet) pairs from EVM wallets
+        let mut all_tron_targets: Vec<(usize, String)> = Vec::new();
 
-        let mut trx_total_sun: u128 = 0;
-        let mut trc20_totals: std::collections::HashMap<
-            String,
-            u128
-        > = std::collections::HashMap::new();
-
-        let (wallets_for_tron, row_index_lookup, derived_from_evm): (
-            Vec<String>,
-            Box<dyn (Fn(&str) -> Result<usize, anyhow::Error>) + Send + Sync>,
-            bool,
-        ) = if !req.tron_wallet_addresses.is_empty() {
-            let f = move |w: &str| {
-                tron_wallet_index
-                    .get(w)
-                    .copied()
-                    .ok_or_else(|| anyhow!("tron wallet index missing"))
-            };
-            (req.tron_wallet_addresses.clone(), Box::new(f), false)
-        } else {
-            let f = move |w: &str| {
-                evm_wallet_index
-                    .get(w)
-                    .copied()
-                    .ok_or_else(|| anyhow!("evm wallet index missing (for tron derived)"))
-            };
-            (req.wallet_addresses.clone(), Box::new(f), true)
-        };
-
-        let owner_for_calls = wallets_for_tron.first().cloned().unwrap_or_default();
-        let owner_for_calls_b58 = if derived_from_evm {
-            TronRpcClient::evm_hex_to_tron_base58(&owner_for_calls).unwrap_or_default()
-        } else {
-            owner_for_calls.clone()
-        };
-
-        for c in &tron_contracts {
-            let d = tron.get_trc20_decimals(c, &owner_for_calls_b58).await.unwrap_or_else(|e| {
-                tracing::error!(contract=%c, error=%e, "tron decimals fetch failed -> default 18");
-                18u32
-            });
-            dec_cache.insert(c.clone(), d);
-        }
-
-        let mut valid_targets: Vec<(String, String, usize)> = Vec::with_capacity(
-            wallets_for_tron.len()
-        );
-
-        for w in &wallets_for_tron {
-            if let Ok(row_idx) = row_index_lookup(w) {
-                let wallet_b58 = if derived_from_evm {
-                    TronRpcClient::evm_hex_to_tron_base58(w).unwrap_or_default()
-                } else {
-                    w.clone()
-                };
-
-                if !wallet_b58.is_empty() {
-                    valid_targets.push((w.clone(), wallet_b58, row_idx));
-                }
+        for (evm_w, &row_idx) in &evm_wallet_index {
+            match crate::tron::address::evm_hex_to_tron_b58(evm_w) {
+                Ok(b58) => all_tron_targets.push((row_idx, b58)),
+                Err(_) => tracing::warn!(wallet = %evm_w, "failed to derive TRON b58 from EVM"),
             }
         }
 
-        // Phase A: Native TRX (Concurrent)
-        let native_results = stream
-            ::iter(valid_targets.clone())
-            .map(|(_orig_w, wallet_b58, row_idx)| {
-                let tron_client = tron.clone();
-                async move {
-                    let sun = tron_client
-                        .get_trx_balance_sun(&wallet_b58).await
-                        .unwrap_or_else(|e| {
-                            TRX_NET_FAIL.fetch_add(1, Ordering::Relaxed);
-                            tracing::error!(wallet=%wallet_b58, error=%e, "tron getaccount failed -> keeping zero");
-                            0u64
-                        });
-                    (row_idx, sun)
-                }
-            })
-            .buffer_unordered(TRON_CONCURRENCY_LIMIT)
-            .collect::<Vec<_>>().await;
+        // Apply wallet budget — cap before fan-out
+        let tron_targets: Vec<(usize, String)> = all_tron_targets
+            .into_iter()
+            .take(TRON_MAX_WALLETS_PER_JOB)
+            .collect();
 
-        for (row_idx, sun) in native_results {
-            trx_total_sun = trx_total_sun.saturating_add(sun as u128);
+        let b58_wallets: Vec<String> = tron_targets.iter().map(|(_, b)| b.clone()).collect();
 
-            // ✅ FIX 2: remove * dereference
-            let data_arr = final_result
-                .get_mut("data")
-                .and_then(|v| v.as_array_mut())
-                .unwrap();
-            let row = data_arr.get_mut(row_idx).unwrap(); // no *
-            let bal_obj = row
-                .get_mut("balance")
-                .and_then(|v| v.as_object_mut())
-                .unwrap();
+        // Apply TRC20 budget — decide whether to do full fetch or native-only
+        let effective_contracts: Vec<String> = trc20_contracts
+            .iter()
+            .take(TRON_MAX_TOKENS_PER_JOB)
+            .cloned()
+            .collect();
 
-            if !bal_obj.contains_key("trx") {
-                bal_obj.insert("trx".to_string(), json!({}));
-            }
-            let trx_obj = bal_obj
-                .get_mut("trx")
-                .and_then(|v| v.as_object_mut())
-                .unwrap();
+        let pair_count = b58_wallets.len() * effective_contracts.len();
+        let do_trc20 = !effective_contracts.is_empty() && pair_count <= TRON_MAX_PAIR_CALLS_PER_JOB;
 
-            trx_obj.insert("trx".to_string(), json!(sun_u128_to_trx_fixed_18(sun as u128)));
+        if !effective_contracts.is_empty() && !do_trc20 {
+            tracing::warn!(
+                wallets = b58_wallets.len(),
+                contracts = trc20_contracts.len(),
+                pair_count = pair_count,
+                limit = TRON_MAX_PAIR_CALLS_PER_JOB,
+                "TRON TRC20 skipped: request too large, fetching native TRX only"
+            );
         }
 
-        // Phase B: TRC20 Calls (Concurrent)
-        let mut trc20_tasks = Vec::new();
-        for (orig_w, wallet_b58, row_idx) in &valid_targets {
-            for c in &tron_contracts {
-                trc20_tasks.push((wallet_b58.clone(), c.clone(), orig_w.clone(), *row_idx));
-            }
-        }
+        // Wrap the entire TRON phase in a hard timeout so a slow provider
+        // never holds EVM/SOL results hostage.
+        let tron_start = Instant::now();
+        let tron_phase = async {
+            let native_balances =
+                fetch_native_trx_concurrent(&tron_rpc, &b58_wallets, TRON_NATIVE_CONCURRENCY).await;
 
-        let trc20_results = stream
-            ::iter(trc20_tasks)
-            .map(|(wallet_b58, contract, _orig_w, row_idx)| {
-                let tron_client = tron.clone();
-                async move {
-                    let amt = tron_client
-                        .get_trc20_balance(&contract, &wallet_b58).await
-                        .unwrap_or_else(|e| {
-                            TRX_NET_FAIL.fetch_add(1, Ordering::Relaxed);
-                            tracing::error!(wallet=%wallet_b58, contract=%contract, error=%e, "trc20 failed");
-                            0u128
-                        });
-                    (row_idx, contract, amt)
-                }
-            })
-            .buffer_unordered(TRON_CONCURRENCY_LIMIT)
-            .collect::<Vec<_>>().await;
-
-        for (row_idx, contract, amt) in trc20_results {
-            *trc20_totals.entry(contract.clone()).or_insert(0u128) += amt;
-
-            let dec = dec_cache.get(&contract).cloned().unwrap_or(18u32);
-            let formatted = u128_base_units_to_fixed_18(amt, dec);
-
-            // ✅ FIX 2: remove * dereference if present (though here row_idx was passed as usize, so it should be fine as just row_idx)
-            let data_arr = final_result
-                .get_mut("data")
-                .and_then(|v| v.as_array_mut())
-                .unwrap();
-            let row = data_arr.get_mut(row_idx).unwrap();
-            let bal_obj = row
-                .get_mut("balance")
-                .and_then(|v| v.as_object_mut())
-                .unwrap();
-
-            if !bal_obj.contains_key("trx") {
-                bal_obj.insert("trx".to_string(), json!({}));
-            }
-            let trx_obj = bal_obj
-                .get_mut("trx")
-                .and_then(|v| v.as_object_mut())
-                .unwrap();
-            trx_obj.insert(contract, json!(formatted));
-        }
-
-        // totals
-        {
-            let totals_balance_obj = final_result
-                .get_mut("total")
-                .and_then(|v| v.as_object_mut())
-                .and_then(|m| m.get_mut("balance"))
-                .and_then(|v| v.as_object_mut())
-                .ok_or_else(|| anyhow!("final_result.total.balance missing or not object"))?;
-
-            if !totals_balance_obj.contains_key("trx") {
-                totals_balance_obj.insert("trx".to_string(), json!({}));
-            }
-
-            if
-                let Some(trx_total_obj) = totals_balance_obj
-                    .get_mut("trx")
-                    .and_then(|v| v.as_object_mut())
+            let trc20_balances: HashMap<String, HashMap<String, ethereum_types::U256>> = if do_trc20
             {
-                trx_total_obj.insert(
-                    "trx".to_string(),
-                    json!(sun_u128_to_trx_fixed_18(trx_total_sun))
-                );
+                fetch_all_tron_balances(
+                    &tron_rpc,
+                    &b58_wallets,
+                    &effective_contracts,
+                    MAX_TRON_CALLS_PER_BATCH,
+                )
+                .await
+            } else {
+                HashMap::new()
+            };
 
-                for c in &tron_contracts {
-                    let sum = trc20_totals.get(c).cloned().unwrap_or(0u128);
-                    let dec = dec_cache.get(c).cloned().unwrap_or(18u32);
-                    trx_total_obj.insert(c.clone(), json!(u128_base_units_to_fixed_18(sum, dec)));
+            let decimals_map: HashMap<String, u32> = if do_trc20 && !b58_wallets.is_empty() {
+                fetch_trc20_decimals(
+                    &tron_rpc,
+                    &effective_contracts,
+                    &b58_wallets[0],
+                    MAX_TRON_CALLS_PER_BATCH,
+                )
+                .await
+            } else {
+                HashMap::new()
+            };
+
+            (native_balances, trc20_balances, decimals_map)
+        };
+
+        match tokio::time::timeout(
+            Duration::from_secs(TRON_TOTAL_PHASE_TIMEOUT_SECS),
+            tron_phase,
+        )
+        .await
+        {
+            Ok((native_balances, trc20_balances, decimals_map)) => {
+                let mut trx_total_sun: u64 = 0;
+                let mut trc20_totals: HashMap<String, ethereum_types::U256> = HashMap::new();
+
+                for (row_idx, b58_w) in &tron_targets {
+                    let sun = *native_balances.get(b58_w).unwrap_or(&0);
+                    trx_total_sun = trx_total_sun.saturating_add(sun);
+
+                    let data_arr = final_result
+                        .get_mut("data")
+                        .and_then(|v| v.as_array_mut())
+                        .unwrap();
+
+                    let row = data_arr.get_mut(*row_idx).unwrap();
+                    let bal_obj = row
+                        .get_mut("balance")
+                        .and_then(|v| v.as_object_mut())
+                        .unwrap();
+
+                    let trx_obj = bal_obj
+                        .entry("trx".to_string())
+                        .or_insert_with(|| json!({}))
+                        .as_object_mut()
+                        .unwrap();
+
+                    trx_obj.insert("trx".to_string(), json!(sun_to_trx_fixed_18(sun)));
+
+                    if let Some(tokens) = trc20_balances.get(b58_w) {
+                        for (contract, amount) in tokens {
+                            let Some(&dec) = decimals_map.get(contract) else {
+                                continue;
+                            };
+                            let formatted = u256_base_units_to_fixed_18(*amount, dec);
+                            trx_obj.insert(contract.clone(), json!(formatted));
+                            *trc20_totals
+                                .entry(contract.clone())
+                                .or_insert_with(ethereum_types::U256::zero) += *amount;
+                        }
+                    }
                 }
+
+                // TRON totals
+                let totals_balance_obj = final_result
+                    .get_mut("total")
+                    .and_then(|v| v.as_object_mut())
+                    .and_then(|m| m.get_mut("balance"))
+                    .and_then(|v| v.as_object_mut())
+                    .unwrap();
+
+                let trx_total_obj = totals_balance_obj
+                    .entry("trx".to_string())
+                    .or_insert_with(|| json!({}))
+                    .as_object_mut()
+                    .unwrap();
+
+                trx_total_obj.insert("trx".to_string(), json!(sun_to_trx_fixed_18(trx_total_sun)));
+
+                for (contract, amount) in &trc20_totals {
+                    let Some(&dec) = decimals_map.get(contract) else {
+                        continue;
+                    };
+                    trx_total_obj.insert(
+                        contract.clone(),
+                        json!(u256_base_units_to_fixed_18(*amount, dec)),
+                    );
+                }
+
+                TRON_NET_OK.fetch_add(1, Ordering::Relaxed);
+
+                tracing::debug!(
+                    elapsed_ms = tron_start.elapsed().as_millis(),
+                    derived_wallets = b58_wallets.len(),
+                    trc20_contracts = effective_contracts.len(),
+                    "tron network processed"
+                );
+            }
+            Err(_) => {
+                // TRON timed out — EVM/SOL are already persisted. Log and continue.
+                TRON_NET_FAIL.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    elapsed_ms = tron_start.elapsed().as_millis(),
+                    budget_secs = TRON_TOTAL_PHASE_TIMEOUT_SECS,
+                    "TRON phase timed out -> job will complete with EVM/SOL only"
+                );
             }
         }
-
-        TRX_NET_OK.fetch_add(1, Ordering::Relaxed);
-        tracing::debug!(
-            elapsed_ms = trx_start.elapsed().as_millis(),
-            trx_ok = TRX_NET_OK.load(Ordering::Relaxed),
-            trx_fail = TRX_NET_FAIL.load(Ordering::Relaxed),
-            contracts = tron_contracts.len(),
-            wallets = wallets_for_tron.len(),
-            derived_from_evm = derived_from_evm,
-            "tron network processed (parallel)"
-        );
     }
 
-    // ✅ COMPARE CHANGE
     let has_changed = final_result != initial_result_json;
 
-    // Final Update
     snapshots.update_one(
         doc! { "requestKey": request_key },
         doc! {
-                "$set": {
-                    "lastUpdatedAt": now,
-                    "refreshState": "idle",
-                    "isComplete": true,
-                    "hasChanged": has_changed, // ✅ UPDATED
-                    "result": bson::to_bson(&final_result).unwrap_or(bson::Bson::Null),
-                    "normalizedRequest": bson::to_bson(&req_sanitized_json).unwrap_or(bson::Bson::Null)
-                }
+            "$set": {
+                "lastUpdatedAt": now,
+                "refreshState": "idle",
+                "isComplete": true,
+                "hasChanged": has_changed,
+                "progressStage": "complete",
+                "result": bson::to_bson(&final_result).unwrap_or(bson::Bson::Null),
+                "normalizedRequest": bson::to_bson(&req_sanitized_json).unwrap_or(bson::Bson::Null)
             }
+        }
     ).await?;
 
-    // Mark job done
-    let jobs = state.mongo.db.collection::<bson::Document>("balance_refresh_jobs");
-
+    let jobs = state
+        .mongo
+        .db
+        .collection::<bson::Document>("balance_refresh_jobs");
     jobs.update_one(
         doc! { "requestKey": request_key },
-        doc! { "$set": { "status": "done", "updatedAt": now } }
-    ).await?;
+        doc! { "$set": { "status": "done", "updatedAt": now } },
+    )
+    .await?;
 
     Ok(())
 }
 
 async fn mark_job_failed(state: &AppState, request_key: &str) -> Result<(), mongodb::error::Error> {
-    let jobs = state.mongo.db.collection::<bson::Document>("balance_refresh_jobs");
+    let jobs = state
+        .mongo
+        .db
+        .collection::<bson::Document>("balance_refresh_jobs");
     let now = DateTime::now();
-
     let job = jobs.find_one(doc! { "requestKey": request_key }).await?;
-    let attempts =
-        job
-            .as_ref()
-            .and_then(|d| d.get_i32("attempts").ok())
-            .unwrap_or(0) + 1;
+
+    let attempts = job
+        .as_ref()
+        .and_then(|d| d.get_i32("attempts").ok())
+        .unwrap_or(0)
+        + 1;
 
     let backoff_secs = (attempts as i64) * 5;
     let next_retry_ms = now.timestamp_millis() + backoff_secs * 1000;
@@ -930,8 +1052,35 @@ async fn mark_job_failed(state: &AppState, request_key: &str) -> Result<(), mong
             },
             "$setOnInsert": { "createdAt": now },
             "$inc": { "attempts": 1 }
-        }
-    ).await?;
+        },
+    )
+    .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ethereum_types::U256;
+
+    #[test]
+    fn tron_token_formatter_keeps_fixed_18_precision() {
+        assert_eq!(
+            u256_base_units_to_fixed_18(U256::from(1_500_000u64), 6),
+            "1.500000000000000000"
+        );
+        assert_eq!(
+            u256_base_units_to_fixed_18(U256::from(1u64), 18),
+            "0.000000000000000001"
+        );
+    }
+
+    #[test]
+    fn tron_token_formatter_never_emits_compact_suffixes() {
+        let formatted = u256_base_units_to_fixed_18(U256::from(1_249_453_151_821u64), 0);
+
+        assert_eq!(formatted, "1249453151821.000000000000000000");
+        assert!(formatted.chars().all(|c| c.is_ascii_digit() || c == '.'));
+    }
 }

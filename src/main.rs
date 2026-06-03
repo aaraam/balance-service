@@ -4,6 +4,7 @@ mod core;
 mod db;
 mod evm;
 mod http;
+mod queue;
 mod solana;
 mod tron;
 mod worker;
@@ -21,6 +22,7 @@ use tracing_subscriber::EnvFilter;
 pub struct AppState {
     pub cfg: AppConfig,
     pub mongo: Arc<Mongo>,
+    pub queue: Arc<queue::nats::NatsQueue>,
 }
 
 #[tokio::main]
@@ -35,12 +37,16 @@ async fn main() -> Result<(), anyhow::Error> {
     let cfg = AppConfig::from_env()?;
     let mongo = Mongo::connect(&cfg).await?;
 
+    let queue = queue::nats::NatsQueue::connect(&cfg).await?;
+    queue.ensure_stream().await?;
+
     let _ = db::snapshots::ensure_indexes(&mongo.db).await;
     let _ = db::refresh_jobs::ensure_indexes(&mongo.db).await;
 
     let state = AppState {
         cfg: cfg.clone(),
         mongo: Arc::new(mongo),
+        queue: Arc::new(queue),
     };
 
     let worker_state = state.clone();
@@ -51,8 +57,16 @@ async fn main() -> Result<(), anyhow::Error> {
     let app = Router::new()
         .route("/health", get(http::handlers::health))
         .route(
+            "/token/get-decimals",
+            post(http::handlers::get_token_decimals),
+        )
+        .route(
             "/wallet/get-multi-wallet-balances",
             post(http::handlers::get_multi_wallet_balances),
+        )
+        .route(
+            "/wallet/status/:request_key",
+            get(http::handlers::get_job_status),
         )
         .with_state(state);
 

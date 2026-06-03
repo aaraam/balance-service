@@ -1,16 +1,28 @@
-// ==================================================
-// balance-service\src\db\snapshots.rs
-// ==================================================
-
 use crate::db::models::BalanceSnapshotDoc;
 use bson::doc;
-use mongodb::Collection;
+use mongodb::{options::FindOneOptions, Collection};
+use serde::{Deserialize, Serialize};
+
+/// Mini-struct for lightweight status polling.
+/// Returned by `get_snapshot_status` — only fetches these fields from Mongo.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SnapshotStatus {
+    #[serde(rename = "isComplete", default)]
+    pub is_complete: bool,
+    #[serde(rename = "hasChanged", default)]
+    pub has_changed: bool,
+    #[serde(rename = "requestKey")]
+    pub request_key: String,
+    /// Stage label written by the worker. May be absent on old snapshots.
+    #[serde(rename = "progressStage")]
+    pub progress_stage: Option<String>,
+}
 
 pub fn snapshots_collection(db: &mongodb::Database) -> Collection<BalanceSnapshotDoc> {
     db.collection::<BalanceSnapshotDoc>("balance_snapshots")
 }
 
-/// Create unique index on requestKey once (call at startup in Phase 2+).
+/// Create unique index on requestKey once
 pub async fn ensure_indexes(db: &mongodb::Database) -> Result<(), mongodb::error::Error> {
     use mongodb::options::IndexOptions;
     use mongodb::IndexModel;
@@ -23,6 +35,28 @@ pub async fn ensure_indexes(db: &mongodb::Database) -> Result<(), mongodb::error
 
     coll.create_index(model).await?;
     Ok(())
+}
+
+/// Fetch ONLY status fields (lightweight) using projection.
+pub async fn get_snapshot_status(
+    db: &mongodb::Database,
+    request_key: &str,
+) -> Result<Option<SnapshotStatus>, mongodb::error::Error> {
+    let coll = db.collection::<SnapshotStatus>("balance_snapshots");
+
+    let filter = doc! { "requestKey": request_key };
+
+    let options = FindOneOptions::builder()
+        .projection(doc! {
+            "isComplete": 1,
+            "hasChanged": 1,
+            "requestKey": 1,
+            "progressStage": 1,
+            "_id": 0
+        })
+        .build();
+
+    coll.find_one(filter).with_options(options).await
 }
 
 pub async fn get_snapshot(
@@ -55,7 +89,8 @@ pub async fn upsert_empty_snapshot(
             "lastUpdatedAt": now,
             "refreshState": "idle",
             "isComplete": false,
-            "hasChanged": true 
+            "hasChanged": false,
+            "progressStage": "queued"
         }
     };
 
@@ -64,7 +99,6 @@ pub async fn upsert_empty_snapshot(
     Ok(())
 }
 
-/// Keeps snapshot state consistent
 pub async fn set_refresh_state(
     db: &mongodb::Database,
     request_key: &str,

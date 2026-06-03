@@ -1,7 +1,3 @@
-// ==================================================
-// balance-service\src\db\models.rs
-// ==================================================
-
 use bson::DateTime;
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +15,12 @@ pub struct BalanceSnapshotDoc {
 
     #[serde(default)]
     pub has_changed: bool,
+
+    /// Tracks which phase the worker has completed.
+    /// Values: "queued" | "evm_done" | "sol_done" | "complete"
+    /// Absent on old snapshots — treated as None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress_stage: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
